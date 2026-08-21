@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent / "dataset"
-PROCESSED_DIR = DATA_DIR / "processed"
+PROCESSED_DIR = Path(__file__).resolve().parent / "processed"
 
 VALID_GENRES = {
     "Action",
@@ -33,6 +34,47 @@ VALID_GENRES = {
     "Western",
     "(no genres listed)",
 }
+
+# Repeat genres so TF-IDF does not get drowned out by noisy free-text tags.
+GENRE_REPEAT = 3
+MIN_TAG_COUNT = 2
+CONTENT_VECTORIZER_PARAMS = {
+    "stop_words": "english",
+    "ngram_range": (1, 2),
+    "min_df": 2,
+    "max_df": 0.95,
+    "sublinear_tf": True,
+}
+
+GENRE_TOKEN_MAP = {
+    "Sci-Fi": "SciFi",
+    "Film-Noir": "FilmNoir",
+    "Children's": "Children",
+}
+
+# Watch-status / queue tags add no movie content signal.
+TAG_STOPWORDS = frozenset(
+    {
+        "in netflix queue",
+        "netflix queue",
+        "netflix",
+        "watched",
+        "seen",
+        "own",
+        "library",
+        "dvd",
+        "blu ray",
+        "bluray",
+        "to see",
+        "want to see",
+        "movie",
+        "movies",
+        "film",
+        "films",
+        "imdb",
+        "tmdb",
+    }
+)
 
 
 def load_raw_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
@@ -119,9 +161,11 @@ def clean_tags(tags: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
-    tags["tag_standardization"] = tags["tag"].str.lower()
+    tags["tag_standardization"] = tags["tag"].map(_normalize_tag)
+    tags = tags.loc[tags["tag_standardization"].ne("")]
+    tags = tags.loc[~tags["tag_standardization"].isin(TAG_STOPWORDS)]
     tags["tagged_at"] = pd.to_datetime(tags["timestamp"], unit="s", utc=True)
-    return tags
+    return tags.reset_index(drop=True)
 
 
 def clean_links(links: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
@@ -141,13 +185,14 @@ def clean_links(links: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
 def filter_by_activity(
     ratings: pd.DataFrame,
     min_user_ratings: int = 20,
-    min_movie_ratings: int = 1,
+    min_movie_ratings: int = 5,
 ) -> pd.DataFrame:
     """
     Iteratively filter sparse users and movies.
 
-    MovieLens already includes users with at least 20 ratings, but this step
-    keeps the pipeline flexible for custom thresholds.
+    MovieLens already includes users with at least 20 ratings. Dropping movies
+    with fewer than 5 ratings removes long-tail noise that hurts both SVD and
+    content similarity.
     """
     filtered = ratings.copy()
 
@@ -167,36 +212,98 @@ def filter_by_activity(
     return filtered.reset_index(drop=True)
 
 
+def _normalize_tag(tag: object) -> str:
+    text = str(tag).lower().strip()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _title_feature_text(title: object) -> str:
+    text = str(title)
+    text = re.sub(r"\s*\(\d{4}\)\s*$", "", text)
+    text = re.sub(r"[^a-zA-Z0-9\s]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _genre_feature_text(genres: object) -> str:
+    raw = str(genres).strip()
+    if not raw or raw == "(no genres listed)":
+        return ""
+    tokens: list[str] = []
+    for genre in raw.split("|"):
+        genre = genre.strip()
+        if not genre or genre == "(no genres listed)":
+            continue
+        token = GENRE_TOKEN_MAP.get(genre, re.sub(r"[^A-Za-z0-9]+", "", genre))
+        if token:
+            tokens.extend([token] * GENRE_REPEAT)
+    return " ".join(tokens)
+
+
+def _year_feature_text(year: object) -> str:
+    try:
+        if pd.isna(year):
+            return ""
+        year_int = int(year)
+    except (TypeError, ValueError):
+        return ""
+    if year_int < 1870 or year_int > 2030:
+        return ""
+    decade = (year_int // 10) * 10
+    return f"year_{year_int} decade_{decade}s"
+
+
 def build_movie_content(movies: pd.DataFrame, tags: pd.DataFrame) -> pd.DataFrame:
     """
-    Combine genres and tags into one text field per movie.
+    Combine title, year, boosted genres, and cleaned tags into one TF-IDF field.
 
     Example:
-        Adventure Animation Children Comedy Fantasy pixar fun
+        toy story year_1995 decade_1990s Adventure Adventure Adventure ... pixar fun
     """
-    genre_text = (
-        movies["genres"]
-        .str.replace("(no genres listed)", "", regex=False)
-        .str.replace("|", " ")
-        .str.strip()
-    )
-
-    tag_column = "tag_standardization" if "tag_standardization" in tags.columns else "tag"
-    tag_text = (
-        tags.groupby("movieId")[tag_column]
-        .apply(lambda values: " ".join(values))
-        .reset_index(name="tags")
-    )
-
     movie_content = movies[["movieId", "title", "genres"]].copy()
-    movie_content["genres_text"] = genre_text
+    if "year" in movies.columns:
+        movie_content["year"] = movies["year"]
+    else:
+        year_match = movie_content["title"].str.extract(r"\((\d{4})\)\s*$")
+        movie_content["year"] = pd.to_numeric(year_match[0], errors="coerce").astype("Int64")
+
+    movie_content["title_text"] = movie_content["title"].map(_title_feature_text)
+    movie_content["year_text"] = movie_content["year"].map(_year_feature_text)
+    movie_content["genres_text"] = movie_content["genres"].map(_genre_feature_text)
+
+    tag_text = _prepare_tag_text(tags)
     movie_content = movie_content.merge(tag_text, on="movieId", how="left")
     movie_content["tags"] = movie_content["tags"].fillna("")
+
     movie_content["content_features"] = (
-        movie_content["genres_text"] + " " + movie_content["tags"]
-    ).str.strip().fillna(movie_content["genres_text"])
-    movie_content["content_features"] = movie_content["content_features"].fillna("")
+        movie_content[["title_text", "year_text", "genres_text", "tags"]]
+        .fillna("")
+        .agg(" ".join, axis=1)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
     return movie_content
+
+
+def _prepare_tag_text(tags: pd.DataFrame) -> pd.DataFrame:
+    if tags.empty:
+        return pd.DataFrame(columns=["movieId", "tags"])
+
+    tag_column = "tag_standardization" if "tag_standardization" in tags.columns else "tag"
+    prepared = tags[["movieId", tag_column]].copy()
+    prepared[tag_column] = prepared[tag_column].map(_normalize_tag)
+    prepared = prepared.loc[prepared[tag_column].ne("")]
+    prepared = prepared.loc[~prepared[tag_column].isin(TAG_STOPWORDS)]
+
+    tag_counts = prepared[tag_column].value_counts()
+    keep_tags = set(tag_counts[tag_counts >= MIN_TAG_COUNT].index)
+    prepared = prepared.loc[prepared[tag_column].isin(keep_tags)]
+
+    return (
+        prepared.groupby("movieId")[tag_column]
+        .apply(lambda values: " ".join(dict.fromkeys(values)))
+        .reset_index(name="tags")
+    )
 
 
 def summarize_data(
@@ -217,13 +324,14 @@ def summarize_data(
         "Rating distribution:\n"
         f"{ratings['rating'].value_counts().sort_index().to_string()}"
     )
+    print(f"Movies with year: {int(movies['year'].notna().sum()):,}" if "year" in movies.columns else "")
 
 
 def preprocess_dataset(
     data_dir: Path = DATA_DIR,
     output_dir: Path = PROCESSED_DIR,
     min_user_ratings: int = 20,
-    min_movie_ratings: int = 1,
+    min_movie_ratings: int = 5,
     save_outputs: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """Run the full cleaning pipeline and optionally save processed files."""
@@ -291,7 +399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-movie-ratings",
         type=int,
-        default=1,
+        default=5,
         help="Minimum number of ratings required per movie.",
     )
     return parser.parse_args()

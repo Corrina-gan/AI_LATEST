@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import importlib
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -19,10 +18,13 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-importlib.reload(hybrid)
-
 HybridRecommender = hybrid.HybridRecommender
 BASE_DIR = Path(__file__).resolve().parent
+PROCESSED_FILES = (
+    "ratings_clean.csv",
+    "movies_clean.csv",
+    "movies_content.csv",
+)
 
 ALGORITHM_OPTIONS = {
     "Hybrid (Content + Collaborative)": "hybrid",
@@ -43,8 +45,23 @@ def _find_processed_file(filename: str) -> Path:
     )
 
 
+def processed_data_signature() -> str:
+    """Cache key that changes when cleaned CSV files are rebuilt."""
+    parts: list[str] = []
+    for filename in PROCESSED_FILES:
+        try:
+            path = _find_processed_file(filename)
+        except FileNotFoundError:
+            parts.append(f"{filename}:missing")
+            continue
+        stat = path.stat()
+        parts.append(f"{filename}:{stat.st_mtime_ns}:{stat.st_size}")
+    return "|".join(parts)
+
+
 @st.cache_data(show_spinner=False)
-def load_dataset() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_dataset(data_sig: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    del data_sig  # used only as a Streamlit cache key
     ratings, movies, movie_content = hybrid.load_data()
     links = pd.read_csv(_find_processed_file("links_clean.csv"))
     links["movieId"] = pd.to_numeric(links["movieId"], errors="coerce").astype("Int64")
@@ -64,36 +81,31 @@ def load_dataset() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFra
 
 
 @st.cache_resource(show_spinner="Training models (content + collaborative + hybrid)^_^")
-def train_models(n_factors: int = 20, test_size: float = 0.2, random_state: int = 42):
-    ratings, movies, movie_content, links, posters = load_dataset()
+def train_models(
+    data_sig: str,
+    n_factors: int = 20,
+    test_size: float = 0.2,
+    random_state: int = 42,
+):
+    ratings, movies, movie_content, links, posters = load_dataset(data_sig)
     train_ratings, test_ratings = hybrid.split_train_test(
         ratings, test_size=test_size, random_state=random_state
     )
 
-    # Fit base models once; hybrid alpha is applied later from the sidebar.
-    base_model = HybridRecommender(alpha=0.5, n_factors=n_factors).fit(
-        train_ratings, movie_content, movies
-    )
-    all_metrics = hybrid.evaluate_all_models(
-        base_model, test_ratings, relevance_threshold=4.0
-    )
-
-    # Also score hybrid across a few alphas for the comparison tab.
-    tuning_rows = []
-    actual, content_scores, cf_scores = hybrid._collect_base_predictions(
-        base_model.content_model,
-        base_model.collaborative_model,
+    # Same evaluation path as `py hybrid.py --tune-alpha`.
+    best_alpha, tuning_results, model, all_metrics = hybrid.tune_alpha(
+        train_ratings,
         test_ratings,
+        movie_content,
+        movies,
+        n_factors=n_factors,
+        relevance_threshold=4.0,
+        metric="f1_score",
     )
-    for alpha in [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]:
-        predicted = (alpha * content_scores) + ((1 - alpha) * cf_scores)
-        metrics = hybrid.evaluate_predictions(actual, predicted, relevance_threshold=4.0)
-        tuning_rows.append({"alpha": alpha, **metrics})
-    tuning_results = pd.DataFrame(tuning_rows)
 
     user_ids = sorted(ratings["userId"].astype(int).unique().tolist())
     return (
-        base_model,
+        model,
         all_metrics,
         tuning_results,
         ratings,
@@ -104,6 +116,7 @@ def train_models(n_factors: int = 20, test_size: float = 0.2, random_state: int 
         user_ids,
         len(train_ratings),
         len(test_ratings),
+        best_alpha,
     )
 
 
@@ -157,30 +170,33 @@ def get_recommendations(
     links: pd.DataFrame,
     posters: pd.DataFrame,
 ) -> tuple[pd.DataFrame, list[str]]:
+    previous_alpha = model.alpha
     model.alpha = float(alpha)
+    try:
+        if algorithm == "content":
+            recs = model.recommend_content(user_id, n_recommendations=top_n)
+            recs = attach_meta(recs, links, posters)
+            display = recs.rename(columns={"predicted_rating": "Score"})
+            return display, ["Score"]
 
-    if algorithm == "content":
-        recs = model.recommend_content(user_id, n_recommendations=top_n)
+        if algorithm == "collaborative":
+            recs = model.recommend_collaborative(user_id, n_recommendations=top_n)
+            recs = attach_meta(recs, links, posters)
+            display = recs.rename(columns={"predicted_rating": "Score"})
+            return display, ["Score"]
+
+        recs = model.recommend(user_id, n_recommendations=top_n)
         recs = attach_meta(recs, links, posters)
-        display = recs.rename(columns={"predicted_rating": "Score"})
-        return display, ["Score"]
-
-    if algorithm == "collaborative":
-        recs = model.recommend_collaborative(user_id, n_recommendations=top_n)
-        recs = attach_meta(recs, links, posters)
-        display = recs.rename(columns={"predicted_rating": "Score"})
-        return display, ["Score"]
-
-    recs = model.recommend(user_id, n_recommendations=top_n)
-    recs = attach_meta(recs, links, posters)
-    display = recs.rename(
-        columns={
-            "content_rating": "Content score",
-            "cf_rating": "Collaborative score",
-            "hybrid_rating": "Hybrid score",
-        }
-    )
-    return display, ["Content score", "Collaborative score", "Hybrid score"]
+        display = recs.rename(
+            columns={
+                "content_rating": "Content score",
+                "cf_rating": "Collaborative score",
+                "hybrid_rating": "Hybrid score",
+            }
+        )
+        return display, ["Content score", "Collaborative score", "Hybrid score"]
+    finally:
+        model.alpha = previous_alpha
 
 
 def render_recommendation_cards(frame: pd.DataFrame, score_columns: list[str]) -> None:
@@ -294,6 +310,7 @@ def main() -> None:
     )
 
     st.title("🎬 Movie Recommendation System")
+    data_sig = processed_data_signature()
 
     try:
         (
@@ -308,7 +325,8 @@ def main() -> None:
             user_ids,
             train_size,
             test_size,
-        ) = train_models()
+            best_alpha,
+        ) = train_models(data_sig)
     except FileNotFoundError as error:
         st.error(str(error))
         st.info("Run `py data_preprocessing.py --output-dir processed` first.")
@@ -323,18 +341,24 @@ def main() -> None:
         algorithm = ALGORITHM_OPTIONS[algorithm_label]
         user_id = st.selectbox("User ID", user_ids, index=user_ids.index(1) if 1 in user_ids else 0)
         top_n = st.slider("Number of recommendations", min_value=1, max_value=20, value=10)
+        alpha_token = (data_sig, round(float(best_alpha), 4))
+        if st.session_state.get("_alpha_token") != alpha_token:
+            st.session_state.hybrid_alpha = float(best_alpha)
+            st.session_state._alpha_token = alpha_token
         alpha = st.slider(
             "Content-based weight (alpha)",
             min_value=0.0,
             max_value=1.0,
-            value=0.50,
             step=0.05,
-            help="Hybrid score = alpha * content + (1 - alpha) * collaborative. "
-            "Only used when Algorithm is Hybrid.",
+            key="hybrid_alpha",
+            help="Maximum content weight. Cold movies use more content; popular movies "
+            "stay closer to SVD. Only used when Algorithm is Hybrid.",
             disabled=algorithm != "hybrid",
         )
         if algorithm == "hybrid":
-            st.caption(f"Collaborative weight = {1 - alpha:.2f}")
+            st.caption(
+                f"Tuned alpha = {best_alpha:.2f}. Popular movies still keep most of the SVD score."
+            )
         if st.button("Clear model cache"):
             st.cache_resource.clear()
             st.cache_data.clear()
@@ -393,8 +417,8 @@ def main() -> None:
     with t1:
         if algorithm == "hybrid":
             st.write(
-                "Recommendations blend a content-based score (genres/tags similarity) "
-                "with a collaborative-filtering score (SVD on the user-movie rating matrix)."
+                "Recommendations use a support-aware hybrid: more SVD when a movie has "
+                "many ratings, more content (title/year/genres/tags) when it is rarely rated."
             )
         elif algorithm == "content":
             st.write(
@@ -454,7 +478,8 @@ def main() -> None:
         st.subheader("Evaluation (80/20 split)")
         st.caption(
             f"Train ratings: {train_size:,} · Test ratings: {test_size:,} · "
-            "Liked = actual rating ≥ 4.0"
+            f"All ratings: {len(ratings):,} · Liked = actual rating ≥ 4.0 · "
+            "Same split and metrics as `py hybrid.py --tune-alpha`"
         )
 
         selected_metrics = all_metrics[algorithm]
@@ -475,6 +500,10 @@ def main() -> None:
     # ---------------------------------------------------------------------
     with t3:
         st.subheader("Model Comparison")
+        st.caption(
+            f"Hybrid uses the F1-tuned alpha ({best_alpha:.2f}), not a 50/50 mix. "
+            "Content-based scores are cosine-weighted neighbor ratings on the 0.5–5 scale."
+        )
         comparison = pd.DataFrame(
             [
                 {"Algorithm": "Content-based (TF-IDF)", **all_metrics["content"]},

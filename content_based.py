@@ -26,9 +26,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import normalize
 
+from data_preprocessing import CONTENT_VECTORIZER_PARAMS, build_movie_content
+
 BASE_DIR = Path(__file__).resolve().parent
 MIN_RATING = 0.5
 MAX_RATING = 5.0
+CONTENT_NEIGHBOR_K = 40
+CONTENT_SHRINKAGE = 12.0
 
 
 def _clip_rating(value: float) -> float:
@@ -42,32 +46,6 @@ def _find_processed_dir() -> Path:
     raise FileNotFoundError(
         "Processed data not found. Run `py data_preprocessing.py` first."
     )
-
-
-def build_movie_content(movies: pd.DataFrame, tags: pd.DataFrame) -> pd.DataFrame:
-    """Combine genres and tags into one text field per movie."""
-    genre_text = (
-        movies["genres"]
-        .str.replace("(no genres listed)", "", regex=False)
-        .str.replace("|", " ")
-        .str.strip()
-    )
-
-    tag_column = "tag_standardization" if "tag_standardization" in tags.columns else "tag"
-    tag_text = (
-        tags.groupby("movieId")[tag_column]
-        .apply(lambda values: " ".join(values))
-        .reset_index(name="tags")
-    )
-
-    movie_content = movies[["movieId", "title", "genres"]].copy()
-    movie_content["genres_text"] = genre_text
-    movie_content = movie_content.merge(tag_text, on="movieId", how="left")
-    movie_content["tags"] = movie_content["tags"].fillna("")
-    movie_content["content_features"] = (
-        movie_content["genres_text"] + " " + movie_content["tags"]
-    ).str.strip().fillna("")
-    return movie_content
 
 
 def load_data(
@@ -136,7 +114,9 @@ class ContentBasedRecommender:
         self.global_mean: float = 3.5
         self.movies: pd.DataFrame | None = None
         self.movie_content: pd.DataFrame | None = None
-        self.vectorizer = TfidfVectorizer(stop_words="english")
+        self.neighbor_k = CONTENT_NEIGHBOR_K
+        self.shrinkage = CONTENT_SHRINKAGE
+        self.vectorizer = TfidfVectorizer(**CONTENT_VECTORIZER_PARAMS)
 
     def fit(
         self,
@@ -213,23 +193,36 @@ class ContentBasedRecommender:
         return float(np.clip(similarity, 0.0, 1.0))
 
     def predict(self, user_id: int, movie_id: int) -> float:
-        """Predict rating via cosine-weighted average of the user's rated movies."""
+        """Predict rating via cosine-weighted kNN of the user's rated movies."""
         if self.tfidf_matrix is None:
             raise RuntimeError("Content model is not fitted.")
 
         movie_index = self.movie_id_to_index.get(movie_id)
         rated_indices = self.user_rated_indices.get(user_id)
         rated_values = self.user_rated_values.get(user_id)
+        user_mean = self.user_means.get(user_id, self.global_mean)
         if movie_index is None or rated_indices is None or rated_values is None:
-            return self.user_means.get(user_id, self.global_mean)
+            return user_mean
 
-        # L2-normalized → cosine similarity is a dot product.
-        similarities = self.tfidf_matrix[rated_indices] @ self.tfidf_matrix[movie_index]
-        weights = np.clip(similarities, 0.0, None)
-        if float(weights.sum()) <= 1e-9:
-            return self.user_means.get(user_id, self.global_mean)
-
-        predicted = float(np.dot(weights, rated_values) / weights.sum())
+        similarities = np.clip(
+            self.tfidf_matrix[rated_indices] @ self.tfidf_matrix[movie_index],
+            0.0,
+            None,
+        )
+        k = min(self.neighbor_k, similarities.size)
+        if k <= 0:
+            return user_mean
+        if similarities.size > k:
+            top = np.argpartition(similarities, -k)[-k:]
+            similarities = similarities[top]
+            rated_values = rated_values[top]
+        mass = float(similarities.sum())
+        if mass <= 1e-9:
+            return user_mean
+        neighbor = float(np.dot(similarities, rated_values) / mass)
+        predicted = (mass * neighbor + self.shrinkage * user_mean) / (
+            mass + self.shrinkage
+        )
         return _clip_rating(predicted)
 
     def top_candidates(
