@@ -7,6 +7,7 @@ import ast
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 
@@ -65,6 +66,273 @@ def _expand_genres(movies: pd.DataFrame) -> pd.DataFrame:
     expanded = expanded.explode("genre")
     expanded["genre"] = expanded["genre"].str.strip()
     return expanded.loc[expanded["genre"].ne("(no genres listed)")]
+
+
+def _white_figure(figsize: tuple[float, float]):
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+    return fig, ax
+
+
+def make_rating_distribution(ratings: pd.DataFrame) -> plt.Figure:
+    """1.1 How users rate movies and which scores are most common."""
+    rating_count = ratings["rating"].value_counts().sort_index()
+    fig, ax = _white_figure((6.2, 3.0))
+    ax.bar(rating_count.index.astype(str), rating_count.values, width=0.4, color="#E85D75")
+    ax.set_xlabel("Rating")
+    ax.set_ylabel("Number of ratings")
+    ax.set_title("Distribution of movie ratings")
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    return fig
+
+
+def make_user_activity(ratings: pd.DataFrame) -> plt.Figure:
+    """1.2 How many ratings each user submitted."""
+    user_activity = ratings.groupby("userId").size().reset_index(name="rating_count")
+    fig, ax = _white_figure((6.2, 3.0))
+    sns.histplot(data=user_activity, x="rating_count", bins=40, color="#5B8FF9", ax=ax)
+    ax.set_title("Distribution of ratings per user")
+    ax.set_xlabel("Number of ratings")
+    ax.set_ylabel("Number of users")
+    fig.tight_layout()
+    return fig
+
+
+def user_activity_stats(ratings: pd.DataFrame) -> pd.Series:
+    return ratings.groupby("userId").size().rename("rating_count").describe().round(2)
+
+
+def make_genre_distribution(movies: pd.DataFrame) -> plt.Figure:
+    """1.3 Genres with the largest number of movies."""
+    genre_count = (
+        movies["genres"]
+        .fillna("")
+        .astype(str)
+        .str.get_dummies()
+        .sum()
+        .drop(labels=["(no genres listed)"], errors="ignore")
+        .sort_values(ascending=False)
+    )
+    fig, ax = _white_figure((6.6, 3.2))
+    ax.bar(genre_count.index.astype(str), genre_count.values, color="#5AD8A6")
+    ax.set_xlabel("Genre")
+    ax.set_ylabel("Number of movies")
+    ax.set_title("Movie genre distribution")
+    ax.tick_params(axis="x", rotation=45)
+    for label in ax.get_xticklabels():
+        label.set_ha("right")
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    return fig
+
+
+def make_movies_by_year(movies: pd.DataFrame) -> plt.Figure:
+    """1.4 How the catalog changes across release years."""
+    movie_year = movies.dropna(subset=["year"]).copy()
+    movie_year["year"] = movie_year["year"].astype(int)
+    year_count = movie_year["year"].value_counts().sort_index()
+    fig, ax = _white_figure((6.6, 3.0))
+    ax.plot(year_count.index, year_count.values, marker="o", color="#E85D75", linewidth=2)
+    ax.set_xlabel("Release year")
+    ax.set_ylabel("Number of movies")
+    ax.set_title("Number of movies released by year")
+    ax.grid(True, color="#D0D3DA", linewidth=0.8)
+    fig.tight_layout()
+    return fig
+
+
+def make_top_tags(tags: pd.DataFrame) -> plt.Figure:
+    """1.5 Most frequently applied user tags."""
+    tag_column = "tag_standardization" if "tag_standardization" in tags.columns else "tag"
+    tag_count = tags[tag_column].value_counts().head(TOP_TAG_COUNT)
+    fig, ax = _white_figure((6.2, 4.0))
+    ax.barh(tag_count.index.astype(str)[::-1], tag_count.values[::-1], color="#2b1153")
+    ax.set_xlabel("Number of tags")
+    ax.set_ylabel("Tag")
+    ax.set_title("Top 20 most common movie tags")
+    fig.tight_layout()
+    return fig
+
+
+def genre_rating_stats(movies: pd.DataFrame, ratings: pd.DataFrame) -> pd.DataFrame:
+    movie_genres = movies[["movieId", "genres"]].copy()
+    movie_genres = movie_genres.assign(genre=movie_genres["genres"].str.split("|")).explode(
+        "genre"
+    )
+    movie_genres["genre"] = movie_genres["genre"].astype(str).str.strip()
+    genre_ratings = movie_genres.merge(ratings[["movieId", "rating"]], on="movieId", how="inner")
+    stats = (
+        genre_ratings.loc[genre_ratings["genre"].ne("(no genres listed)")]
+        .groupby("genre")
+        .agg(average_rating=("rating", "mean"), total_ratings=("rating", "count"))
+        .reset_index()
+        .sort_values("average_rating", ascending=False)
+    )
+    stats["average_rating"] = stats["average_rating"].round(2)
+    return stats
+
+
+def make_average_rating_by_genre(movies: pd.DataFrame, ratings: pd.DataFrame) -> plt.Figure:
+    """1.6 Average user rating across genres."""
+    stats = genre_rating_stats(movies, ratings)
+    fig, ax = _white_figure((6.2, 4.0))
+    sns.barplot(data=stats, x="average_rating", y="genre", color="#5B8FF9", ax=ax)
+    ax.set_title("Average movie rating across different genres")
+    ax.set_xlabel("Average rating")
+    ax.set_ylabel("Genre")
+    fig.tight_layout()
+    return fig
+
+
+def make_ratings_over_time(ratings: pd.DataFrame) -> plt.Figure:
+    """1.7 Rating volume by the year ratings were submitted."""
+    work = ratings.copy()
+    work["rated_at"] = pd.to_datetime(work["rated_at"], utc=True)
+    work["rating_year"] = work["rated_at"].dt.year
+    ratings_over_time = work.groupby("rating_year").size().reset_index(name="rating_count")
+    fig, ax = _white_figure((6.6, 3.0))
+    sns.lineplot(
+        data=ratings_over_time,
+        x="rating_year",
+        y="rating_count",
+        marker="o",
+        color="#E85D75",
+        ax=ax,
+    )
+    ax.set_title("User rating activity over time")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Number of ratings")
+    ax.grid(True, color="#D0D3DA", linewidth=0.8)
+    fig.tight_layout()
+    return fig
+
+
+_DONUT_FILLED = "#0984e3"
+_DONUT_EMPTY = "#dfe6e9"
+_PARETO_BAR = "#2c3e50"
+_PARETO_LINE = "#e67e22"
+
+
+def make_matrix_sparsity_donut(ratings: pd.DataFrame) -> plt.Figure:
+    """Filled vs empty cells in the user–item rating matrix."""
+    matrix = ratings.pivot_table(index="userId", columns="movieId", values="rating")
+    total_cells = int(matrix.shape[0] * matrix.shape[1])
+    filled_cells = int(matrix.notna().sum().sum())
+    empty_cells = total_cells - filled_cells
+    filled_pct = 100.0 * filled_cells / total_cells if total_cells else 0.0
+
+    fig, ax = _white_figure((5.0, 2.6))
+    wedges, _ = ax.pie(
+        [filled_cells, empty_cells],
+        colors=[_DONUT_FILLED, _DONUT_EMPTY],
+        startangle=90,
+        counterclock=False,
+        wedgeprops={"width": 0.42, "edgecolor": "white", "linewidth": 2},
+    )
+    ax.text(
+        0,
+        0.1,
+        f"{filled_pct:.1f}%",
+        ha="center",
+        va="center",
+        fontsize=16,
+        fontweight="bold",
+        color=_DONUT_FILLED,
+    )
+    ax.text(0, -0.15, "filled", ha="center", va="center", fontsize=8, color="dimgray")
+    ax.legend(
+        wedges,
+        [f"Filled ({filled_pct:.1f}%)", f"Empty ({100 - filled_pct:.1f}%)"],
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False,
+        fontsize=8,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def sparsity_stats(ratings: pd.DataFrame) -> tuple[float, int, int]:
+    n_users = int(ratings["userId"].nunique())
+    n_movies = int(ratings["movieId"].nunique())
+    filled_pct = 100.0 * len(ratings) / (n_users * n_movies) if n_users and n_movies else 0.0
+    return filled_pct, n_users, n_movies
+
+
+def make_long_tail_pareto(ratings: pd.DataFrame) -> tuple[plt.Figure, float, float]:
+    """Movie popularity rank vs ratings, with an 80% cumulative curve."""
+    counts = ratings.groupby("movieId").size().sort_values(ascending=False)
+    total_movies = len(counts)
+    total_ratings = int(counts.sum())
+    ranks = np.arange(1, total_movies + 1)
+    cum_pct = counts.cumsum() / total_ratings * 100
+    pct_le5 = float((counts <= 5).mean() * 100)
+    n_to_80 = int((cum_pct < 80).sum() + 1)
+    pct_movies_to_80 = n_to_80 / total_movies * 100
+
+    fig, ax1 = _white_figure((6.4, 2.8))
+    ax1.bar(ranks, counts.values, width=1.0, color=_PARETO_BAR, alpha=0.75)
+    ax1.set_yscale("log")
+    ax1.set_xlabel("Movie rank (most-rated first)", fontsize=9)
+    ax1.set_ylabel("Ratings / movie (log)", color=_PARETO_BAR, fontsize=9)
+    ax1.tick_params(axis="y", labelcolor=_PARETO_BAR)
+
+    ax2 = ax1.twinx()
+    ax2.set_facecolor("none")
+    ax2.plot(ranks, cum_pct.values, color=_PARETO_LINE, linewidth=2)
+    ax2.set_ylabel("Cumulative % of ratings", color=_PARETO_LINE, fontsize=9)
+    ax2.tick_params(axis="y", labelcolor=_PARETO_LINE)
+    ax2.set_ylim(0, 105)
+    ax2.axhline(80, color=_PARETO_LINE, linestyle="--", linewidth=1, alpha=0.6)
+    ax2.axvline(n_to_80, color=_PARETO_LINE, linestyle="--", linewidth=1, alpha=0.6)
+    ax2.annotate(
+        f"{pct_movies_to_80:.1f}% of movies\n= 80% of ratings",
+        xy=(n_to_80, 80),
+        xytext=(n_to_80 + total_movies * 0.1, 50),
+        fontsize=8,
+        color=_PARETO_LINE,
+        arrowprops={"arrowstyle": "->", "color": _PARETO_LINE, "lw": 1},
+    )
+    fig.tight_layout()
+    return fig, pct_movies_to_80, pct_le5
+
+
+def make_genre_decade_heatmap(ratings: pd.DataFrame, movies: pd.DataFrame) -> plt.Figure:
+    """Average rating by genre and release decade."""
+    work = ratings.merge(movies[["movieId", "genres", "year"]], on="movieId", how="inner")
+    work = work.dropna(subset=["genres", "year", "rating"]).copy()
+    work["decade"] = (work["year"].astype(int) // 10 * 10).astype(str) + "s"
+    work = work.assign(genre=work["genres"].str.split("|")).explode("genre")
+    work["genre"] = work["genre"].astype(str).str.strip()
+    work = work.loc[work["genre"].ne("(no genres listed)") & work["genre"].ne("")]
+    top_genres = work["genre"].value_counts().head(10).index
+    work = work.loc[work["genre"].isin(top_genres)]
+    pivot = work.pivot_table(index="genre", columns="decade", values="rating", aggfunc="mean")
+    pivot = pivot.reindex(sorted(pivot.columns, key=lambda decade: int(decade[:-1])), axis=1)
+    pivot = pivot.loc[pivot.mean(axis=1).sort_values(ascending=False).index]
+
+    fig, ax = _white_figure((6.6, 3.4))
+    sns.heatmap(
+        pivot,
+        annot=True,
+        fmt=".1f",
+        cmap="YlGnBu",
+        vmin=1.5,
+        annot_kws={"size": 7, "fontweight": "bold"},
+        linewidths=0.4,
+        linecolor="white",
+        cbar_kws={"label": "Avg. rating"},
+        ax=ax,
+    )
+    ax.set_xlabel("Release decade")
+    ax.set_ylabel("Genre")
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+    fig.tight_layout()
+    return fig
 
 
 def plot_rating_distribution(ratings: pd.DataFrame, output_dir: Path) -> Path:

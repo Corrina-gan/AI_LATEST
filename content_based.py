@@ -26,9 +26,40 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import normalize
 
+from data_preprocessing import CONTENT_VECTORIZER_PARAMS, build_movie_content
+
 BASE_DIR = Path(__file__).resolve().parent
 MIN_RATING = 0.5
 MAX_RATING = 5.0
+CONTENT_NEIGHBOR_K = 40
+CONTENT_SHRINKAGE = 12.0
+# Key used by app.py ALGORITHM_OPTIONS. Sidebar diversity is only active
+# when this algorithm is selected — hybrid does not use these controls.
+ALGORITHM_KEY = "content"
+
+# Kept consistent everywhere: genre chips, why-table, and the profile chart.
+GENRE_COLORS = {
+    "Action": "#2EC4B6",
+    "Adventure": "#7BD389",
+    "Animation": "#F4D35E",
+    "Children": "#90BE6D",
+    "Comedy": "#FFB703",
+    "Crime": "#2A9D8F",
+    "Documentary": "#4CC9F0",
+    "Drama": "#4C9AFF",
+    "Fantasy": "#7B5EA7",
+    "Film-Noir": "#4A4E69",
+    "Horror": "#9B2226",
+    "IMAX": "#48CAE4",
+    "Musical": "#E5989B",
+    "Mystery": "#577590",
+    "Romance": "#F4A261",
+    "Sci-Fi": "#E76F51",
+    "Thriller": "#E63946",
+    "War": "#52B788",
+    "Western": "#BC6C25",
+}
+DEFAULT_GENRE_COLOR = "#6B7280"
 
 
 def _clip_rating(value: float) -> float:
@@ -42,32 +73,6 @@ def _find_processed_dir() -> Path:
     raise FileNotFoundError(
         "Processed data not found. Run `py data_preprocessing.py` first."
     )
-
-
-def build_movie_content(movies: pd.DataFrame, tags: pd.DataFrame) -> pd.DataFrame:
-    """Combine genres and tags into one text field per movie."""
-    genre_text = (
-        movies["genres"]
-        .str.replace("(no genres listed)", "", regex=False)
-        .str.replace("|", " ")
-        .str.strip()
-    )
-
-    tag_column = "tag_standardization" if "tag_standardization" in tags.columns else "tag"
-    tag_text = (
-        tags.groupby("movieId")[tag_column]
-        .apply(lambda values: " ".join(values))
-        .reset_index(name="tags")
-    )
-
-    movie_content = movies[["movieId", "title", "genres"]].copy()
-    movie_content["genres_text"] = genre_text
-    movie_content = movie_content.merge(tag_text, on="movieId", how="left")
-    movie_content["tags"] = movie_content["tags"].fillna("")
-    movie_content["content_features"] = (
-        movie_content["genres_text"] + " " + movie_content["tags"]
-    ).str.strip().fillna("")
-    return movie_content
 
 
 def load_data(
@@ -113,6 +118,182 @@ def split_train_test(
     return train_df, test_df
 
 
+def split_movie_genres(value: object) -> list[str]:
+    """Split a MovieLens genres cell into clean labels."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value]
+    else:
+        text = str(value)
+        parts = text.split("|")
+    return [part.strip() for part in parts if part.strip() and part.strip() != "(no genres listed)"]
+
+
+def catalog_genres(movies: pd.DataFrame) -> list[str]:
+    """Sorted unique genres in the catalog, used by the More Like This picker."""
+    labels: set[str] = set()
+    for value in movies["genres"].dropna():
+        labels.update(split_movie_genres(value))
+    return sorted(labels)
+
+
+def user_genre_profile(
+    ratings: pd.DataFrame,
+    movies: pd.DataFrame,
+    user_id: int,
+    min_rating: float = 3.0,
+) -> pd.DataFrame:
+    """Share of a user's taste per genre.
+
+    Ratings below ``min_rating`` are ignored. Each kept rating is split evenly
+    across that movie's genres, then shares are normalised to 100%.
+    """
+    user = ratings.loc[
+        (ratings["userId"] == int(user_id)) & (ratings["rating"] >= min_rating)
+    ].copy()
+    if user.empty:
+        return pd.DataFrame(columns=["genre", "share", "percent", "color"])
+
+    merged = user.merge(movies[["movieId", "genres"]], on="movieId", how="left")
+    weights: dict[str, float] = {}
+    for row in merged.itertuples():
+        genres = split_movie_genres(getattr(row, "genres", None))
+        if not genres:
+            continue
+        piece = float(row.rating) / len(genres)
+        for genre in genres:
+            weights[genre] = weights.get(genre, 0.0) + piece
+
+    total = sum(weights.values())
+    if total <= 0:
+        return pd.DataFrame(columns=["genre", "share", "percent", "color"])
+
+    rows = [
+        {
+            "genre": genre,
+            "share": weight / total,
+            "percent": 100.0 * weight / total,
+            "color": GENRE_COLORS.get(genre, DEFAULT_GENRE_COLOR),
+        }
+        for genre, weight in weights.items()
+    ]
+    return (
+        pd.DataFrame(rows).sort_values("percent", ascending=False).reset_index(drop=True)
+    )
+
+
+def plot_genre_profile(
+    profile: pd.DataFrame, user_id: int, top_n: int = 10
+):
+    """Horizontal bar chart of a user's genre share (same colours as the pills)."""
+    import matplotlib.pyplot as plt
+
+    data = profile.head(top_n).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(8.6, 4.8))
+    fig.patch.set_facecolor("#FFFFFF")
+    ax.set_facecolor("#FFFFFF")
+    if data.empty:
+        ax.set_title(f"User {user_id}'s Genre Preferences", color="#31333F")
+        ax.text(0.5, 0.5, "Not enough liked ratings", ha="center", color="#6B7280")
+        ax.set_axis_off()
+        fig.tight_layout()
+        return fig
+
+    bars = ax.barh(
+        data["genre"],
+        data["percent"],
+        color=data["color"],
+        height=0.66,
+    )
+    ax.set_title(f"User {user_id}'s Genre Preferences", color="#31333F", pad=12)
+    xmax = max(25.0, float(data["percent"].max()) * 1.18)
+    ax.set_xlim(0, xmax)
+    ax.tick_params(colors="#31333F", labelsize=10)
+    ax.spines[:].set_visible(False)
+    ax.grid(axis="x", color="#E5E7EB", linewidth=0.6)
+    ax.set_axisbelow(True)
+    ax.set_xlabel("")
+    for bar, percent in zip(bars, data["percent"], strict=True):
+        ax.text(
+            bar.get_width() + 0.35,
+            bar.get_y() + bar.get_height() / 2,
+            f"{percent:.0f}%",
+            va="center",
+            color="#31333F",
+            fontsize=9,
+        )
+    fig.tight_layout()
+    return fig
+
+
+def genre_pill_html(genre: str) -> str:
+    from html import escape
+
+    color = GENRE_COLORS.get(genre, DEFAULT_GENRE_COLOR)
+    return (
+        f'<span class="genre-pill" style="background:{color}">{escape(genre)}</span>'
+    )
+
+
+def why_recommended_table_html(
+    frame: pd.DataFrame,
+    reasons: dict[int, list[str]],
+    empty_why: str = "Matches your profile",
+) -> str:
+    """Pretty content-based table: genre pills, % bars, and why-recommended notes."""
+    from html import escape
+
+    rows_html: list[str] = []
+    for number, row in enumerate(frame.itertuples(), start=1):
+        movie_id = int(row.movieId)
+        title = escape(str(getattr(row, "title", "Unknown title")))
+        pills = "".join(genre_pill_html(genre) for genre in split_movie_genres(getattr(row, "genres", "")))
+        similarity = getattr(row, "similarity", None)
+        if similarity is not None and not pd.isna(similarity):
+            for_you = int(round(float(np.clip(similarity, 0.0, 1.0)) * 100))
+        else:
+            score = None
+            for name in ("Score", "predicted_rating", "Hybrid_score", "hybrid_rating"):
+                if hasattr(row, name):
+                    value = getattr(row, name)
+                    if value is not None and not pd.isna(value):
+                        score = value
+                        break
+            for_you = (
+                int(round(float(score) / MAX_RATING * 100)) if score is not None else 0
+            )
+        avg = getattr(row, "avg_rating", None)
+        avg_pct = int(round(float(avg) / MAX_RATING * 100)) if avg is not None and pd.notna(avg) else 0
+        why_bits = reasons.get(movie_id, [])
+        why = "".join(
+            f'<div class="why-line">✓ {escape(item)}</div>' for item in why_bits
+        ) or f'<span class="why-empty">{escape(empty_why)}</span>'
+        rows_html.append(
+            "<tr>"
+            f"<td class='num'>{number}</td>"
+            f"<td class='title-cell'>{title}</td>"
+            f"<td class='genre-cell'>{pills}</td>"
+            f"<td class='pct-cell'><span>{for_you}%</span>"
+            f"<div class='bar'><div class='fill fill-you' style='width:{for_you}%'></div></div></td>"
+            f"<td class='pct-cell'><span>{avg_pct}%</span>"
+            f"<div class='bar'><div class='fill fill-avg' style='width:{avg_pct}%'></div></div></td>"
+            f"<td class='why-cell'>{why}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<table class='why-table'>"
+        "<thead><tr>"
+        "<th>No.</th><th>Movie</th><th>Genres</th>"
+        "<th class='you'>Rating (for you)</th>"
+        "<th class='avg'>Average Rating</th>"
+        "<th>Why recommended?</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody></table>"
+    )
+
+
 class ContentBasedRecommender:
     """
     Content-based recommender: TF-IDF over genres/tags + cosine similarity.
@@ -136,7 +317,9 @@ class ContentBasedRecommender:
         self.global_mean: float = 3.5
         self.movies: pd.DataFrame | None = None
         self.movie_content: pd.DataFrame | None = None
-        self.vectorizer = TfidfVectorizer(stop_words="english")
+        self.neighbor_k = CONTENT_NEIGHBOR_K
+        self.shrinkage = CONTENT_SHRINKAGE
+        self.vectorizer = TfidfVectorizer(**CONTENT_VECTORIZER_PARAMS)
 
     def fit(
         self,
@@ -213,23 +396,36 @@ class ContentBasedRecommender:
         return float(np.clip(similarity, 0.0, 1.0))
 
     def predict(self, user_id: int, movie_id: int) -> float:
-        """Predict rating via cosine-weighted average of the user's rated movies."""
+        """Predict rating via cosine-weighted kNN of the user's rated movies."""
         if self.tfidf_matrix is None:
             raise RuntimeError("Content model is not fitted.")
 
         movie_index = self.movie_id_to_index.get(movie_id)
         rated_indices = self.user_rated_indices.get(user_id)
         rated_values = self.user_rated_values.get(user_id)
+        user_mean = self.user_means.get(user_id, self.global_mean)
         if movie_index is None or rated_indices is None or rated_values is None:
-            return self.user_means.get(user_id, self.global_mean)
+            return user_mean
 
-        # L2-normalized → cosine similarity is a dot product.
-        similarities = self.tfidf_matrix[rated_indices] @ self.tfidf_matrix[movie_index]
-        weights = np.clip(similarities, 0.0, None)
-        if float(weights.sum()) <= 1e-9:
-            return self.user_means.get(user_id, self.global_mean)
-
-        predicted = float(np.dot(weights, rated_values) / weights.sum())
+        similarities = np.clip(
+            self.tfidf_matrix[rated_indices] @ self.tfidf_matrix[movie_index],
+            0.0,
+            None,
+        )
+        k = min(self.neighbor_k, similarities.size)
+        if k <= 0:
+            return user_mean
+        if similarities.size > k:
+            top = np.argpartition(similarities, -k)[-k:]
+            similarities = similarities[top]
+            rated_values = rated_values[top]
+        mass = float(similarities.sum())
+        if mass <= 1e-9:
+            return user_mean
+        neighbor = float(np.dot(similarities, rated_values) / mass)
+        predicted = (mass * neighbor + self.shrinkage * user_mean) / (
+            mass + self.shrinkage
+        )
         return _clip_rating(predicted)
 
     def top_candidates(
@@ -354,6 +550,134 @@ class ContentBasedRecommender:
                 how="left",
             )
         return recommendations.reset_index(drop=True)
+
+    def similar_to_genre(
+        self,
+        genre: str | list[str] | tuple[str, ...],
+        n_recommendations: int = 10,
+        user_id: int | None = None,
+    ) -> pd.DataFrame:
+        """Rank unseen movies by cosine similarity to the chosen genre's TF-IDF centroid."""
+        if getattr(self, "movies", None) is None or self.tfidf_matrix is None:
+            raise RuntimeError("Content model is not fitted.")
+
+        if isinstance(genre, str):
+            wanted = [genre.strip()]
+        else:
+            wanted = [str(item).strip() for item in genre if str(item).strip()]
+        wanted = [item for item in wanted if item]
+        if not wanted:
+            raise ValueError("Pick at least one genre.")
+        label = " + ".join(wanted)
+
+        def matches(genres_value: object, require_all: bool) -> bool:
+            movie_genres = set(split_movie_genres(genres_value))
+            if require_all:
+                return all(name in movie_genres for name in wanted)
+            return any(name in movie_genres for name in wanted)
+
+        seed_ids = [
+            int(movie_id)
+            for movie_id, genres in zip(
+                self.movies["movieId"], self.movies["genres"], strict=False
+            )
+            if matches(genres, require_all=True)
+        ]
+        if not seed_ids and len(wanted) > 1:
+            seed_ids = [
+                int(movie_id)
+                for movie_id, genres in zip(
+                    self.movies["movieId"], self.movies["genres"], strict=False
+                )
+                if matches(genres, require_all=False)
+            ]
+        seed_indices = [
+            self.movie_id_to_index[movie_id]
+            for movie_id in seed_ids
+            if movie_id in self.movie_id_to_index
+        ]
+        if not seed_indices:
+            raise ValueError(f"No movies found for genre '{label}'.")
+
+        centroid = self.tfidf_matrix[seed_indices].mean(axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm > 1e-12:
+            centroid = centroid / norm
+
+        scores = self.tfidf_matrix @ centroid
+        rated = set(self.user_ratings.get(int(user_id), {})) if user_id is not None else set()
+        ranked = np.argsort(scores)[::-1]
+        picked: list[int] = []
+        picked_scores: list[float] = []
+        for index in ranked:
+            movie_id = int(self.movie_ids[index])
+            if movie_id in rated:
+                continue
+            picked.append(movie_id)
+            picked_scores.append(float(np.clip(scores[index], 0.0, 1.0)))
+            if len(picked) >= n_recommendations:
+                break
+        if not picked:
+            raise ValueError(f"No unseen movies found for genre '{label}'.")
+
+        frame = pd.DataFrame(
+            {
+                "movieId": picked,
+                "similarity": picked_scores,
+                "predicted_rating": [
+                    self.predict(int(user_id), movie_id) if user_id is not None else np.nan
+                    for movie_id in picked
+                ],
+            }
+        )
+        return frame.merge(
+            self.movies[["movieId", "title", "genres"]],
+            on="movieId",
+            how="left",
+        ).reset_index(drop=True)
+
+    def recommendation_reasons(self, user_id: int, movie_id: int) -> list[str]:
+        """Short why-recommended notes: shared liked genres + nearest 4★+ neighbour."""
+        if getattr(self, "movies", None) is None or self.tfidf_matrix is None:
+            return []
+
+        movie_row = self.movies.loc[self.movies["movieId"] == int(movie_id)]
+        if movie_row.empty:
+            return []
+        rec_genres = split_movie_genres(movie_row.iloc[0]["genres"])
+
+        liked = [
+            (mid, rating)
+            for mid, rating in self.user_ratings.get(int(user_id), {}).items()
+            if rating >= 4.0
+        ]
+        liked_genres: set[str] = set()
+        for mid, _rating in liked:
+            liked_row = self.movies.loc[self.movies["movieId"] == int(mid)]
+            if liked_row.empty:
+                continue
+            liked_genres.update(split_movie_genres(liked_row.iloc[0]["genres"]))
+
+        reasons = [genre for genre in rec_genres if genre in liked_genres][:3]
+
+        rec_index = self.movie_id_to_index.get(int(movie_id))
+        best: tuple[float, int, float] | None = None
+        if rec_index is not None:
+            for mid, rating in liked:
+                other_index = self.movie_id_to_index.get(int(mid))
+                if other_index is None:
+                    continue
+                similarity = float(self.tfidf_matrix[rec_index] @ self.tfidf_matrix[other_index])
+                if best is None or similarity > best[0]:
+                    best = (similarity, int(mid), float(rating))
+        if best is not None and best[0] >= 0.08:
+            neighbour = self.movies.loc[self.movies["movieId"] == best[1]]
+            if not neighbour.empty:
+                title = str(neighbour.iloc[0]["title"])
+                reasons.append(
+                    f"Similar to '{title}' (you rated it {best[2]:.0f}★)"
+                )
+        return reasons
 
     # ------------------------------------------------------------------
     # Evaluation (same protocol as collaborative_filtering.py)
@@ -509,6 +833,36 @@ class ContentBasedRecommender:
             "n_users_evaluated": float(len(precisions)),
         }
 
+
+def render_diversity_controls(*, enabled: bool = True) -> tuple[bool, float]:
+    """Draw MMR diversity widgets in the current Streamlit sidebar.
+
+    Call this only when Content-based is selected so other algorithms do not
+    show these controls.
+    """
+    import streamlit as st
+
+    diversify = st.checkbox(
+        "Diversify recommendations",
+        value=False,
+        disabled=not enabled,
+        help=(
+            "Re-ranks the top results with MMR so they aren't near-duplicates "
+            "of each other (e.g. 10 Pixar sequels back to back)."
+        ),
+    )
+    diversity_strength = st.slider(
+        "Diversity strength",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.3,
+        step=0.05,
+        disabled=not enabled or not diversify,
+        help="0 = pure relevance ranking, 1 = maximise spread over relevance.",
+    )
+    if not enabled:
+        return False, 0.3
+    return bool(diversify), float(diversity_strength)
 
 
 def demo(
