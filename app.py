@@ -1264,6 +1264,15 @@ def render_content_recs(
             display, reasons, empty_why="Matches your content profile"
         )
     )
+    if diversify:
+        baseline = content_model.recommend(user_id, n_recommendations=top_n, diversify=False)
+        st.markdown("**🔀 Before vs after diversity**")
+        st.caption(
+            "Same rank, two rankings: relevance-only on the left, MMR-diversified "
+            "(current diversity strength) on the right. Highlighted titles on the "
+            "right replaced a different movie at that rank."
+        )
+        st.html(content_based.diversity_comparison_table_html(baseline, display))
     _recs_table(display)
 
 
@@ -2106,6 +2115,30 @@ def main() -> None:
         table.why-table .why-line { margin: 0 0 4px; color: #047857; }
         table.why-table .why-empty { color: #6B7280; }
         table.why-table tbody tr:hover { background: #FFF7F9; }
+        table.diversity-table th.grp-orig, table.diversity-table th.grp-div {
+            text-align: center;
+            font-weight: 700;
+        }
+        table.diversity-table th.grp-orig { color: #6B7280; }
+        table.diversity-table th.grp-div { color: #6D28D9; }
+        table.diversity-table th:nth-child(5),
+        table.diversity-table td:nth-child(5) {
+            border-left: 2px solid #E5E7EB;
+        }
+        table.diversity-table td.title-cell.changed {
+            color: #6D28D9;
+            position: relative;
+        }
+        table.diversity-table td.title-cell.changed::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: 8px;
+            bottom: 8px;
+            width: 3px;
+            border-radius: 999px;
+            background: #7B5EA7;
+        }
         .blend-badge {
             display: inline-block;
             border-radius: 999px;
