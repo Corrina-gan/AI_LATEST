@@ -1,13 +1,6 @@
 """
 Collaborative Filtering engine for the Movie Recommender assignment.
 
-Implements the `CollaborativeFiltering` class: fit once on the user-item
-rating matrix, then predict with any of three model variants. Kept
-independent of Streamlit and of `hybrid.py` so it can be unit tested and
-reused on its own; `app.py` wraps a single instance with
-`@st.cache_resource` so heavy sub-computations (similarity matrices, SVD)
-are memoized in-process instead of recomputed on every widget interaction.
-
 Model variants:
 1. User-based CF   -> cosine similarity between user rating vectors.
 2. Item-based CF    -> cosine, or adjusted-cosine ("Pearson-style"),
@@ -438,7 +431,7 @@ class CollaborativeFiltering:
             )
             stats["confidence"] = (stats["vote_count"] / stats["vote_count"].max()).clip(upper=1.0)
             self._popular_movies_cache = stats.sort_values("predicted_rating", ascending=False)[
-                ["predicted_rating", "confidence", "vote_count", "avg_rating"]
+                ["predicted_rating", "confidence"]
             ]
             self._popular_movies_cache.index.name = "movieId"
         return self._popular_movies_cache
@@ -479,7 +472,7 @@ class CollaborativeFiltering:
         out["predicted_rating"] = out["predicted_rating"].astype(float).round(4)
         out["confidence"] = out["confidence"].astype(float).round(4)
         columns = ["movieId", "predicted_rating", "confidence"]
-        for extra in ("title", "genres", "year", "vote_count", "avg_rating"):
+        for extra in ("title", "genres", "year"):
             if extra in out.columns:
                 columns.append(extra)
         return out[columns].reset_index(drop=True)
