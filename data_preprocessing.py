@@ -24,7 +24,6 @@ VALID_GENRES = {
     "Fantasy",
     "Film-Noir",
     "Horror",
-    "IMAX",
     "Musical",
     "Mystery",
     "Romance",
@@ -34,6 +33,9 @@ VALID_GENRES = {
     "Western",
     "(no genres listed)",
 }
+
+# Screening formats, not story genres. Strip these from genre_list / TF-IDF.
+DROPPED_GENRE_LABELS = frozenset({"IMAX"})
 
 # Repeat genres so TF-IDF does not get drowned out by noisy free-text tags.
 GENRE_REPEAT = 3
@@ -87,6 +89,21 @@ def load_raw_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
     }
 
 
+def _normalize_genre_list(genres: object) -> list[str]:
+    """Drop non-genre labels such as IMAX; keep a placeholder if nothing remains."""
+    if isinstance(genres, list):
+        raw = genres
+    else:
+        raw = str(genres).split("|")
+    cleaned = [
+        genre.strip()
+        for genre in raw
+        if str(genre).strip()
+        and str(genre).strip() not in DROPPED_GENRE_LABELS
+    ]
+    return cleaned or ["(no genres listed)"]
+
+
 def clean_movies(movies: pd.DataFrame) -> pd.DataFrame:
     """Clean movie metadata and derive useful columns."""
     movies = movies.copy()
@@ -97,8 +114,9 @@ def clean_movies(movies: pd.DataFrame) -> pd.DataFrame:
     year_match = movies["title"].str.extract(r"\((\d{4})\)\s*$")
     movies["year"] = pd.to_numeric(year_match[0], errors="coerce").astype("Int64")
 
-    # Split pipe-separated genres and flag invalid genre labels.
-    movies["genre_list"] = movies["genres"].str.split("|")
+    # Split pipe-separated genres, drop IMAX, and rebuild the joined string.
+    movies["genre_list"] = movies["genres"].str.split("|").map(_normalize_genre_list)
+    movies["genres"] = movies["genre_list"].map(lambda parts: "|".join(parts))
     invalid_genre_mask = movies["genre_list"].apply(
         lambda genres: any(genre not in VALID_GENRES for genre in genres)
     )
@@ -232,7 +250,7 @@ def _genre_feature_text(genres: object) -> str:
     tokens: list[str] = []
     for genre in raw.split("|"):
         genre = genre.strip()
-        if not genre or genre == "(no genres listed)":
+        if not genre or genre == "(no genres listed)" or genre in DROPPED_GENRE_LABELS:
             continue
         token = GENRE_TOKEN_MAP.get(genre, re.sub(r"[^A-Za-z0-9]+", "", genre))
         if token:

@@ -45,6 +45,49 @@ def _find_processed_dir() -> Path:
     )
 
 
+def blend_hybrid_details(
+    content_scores: np.ndarray,
+    cf_scores: np.ndarray,
+    movie_ids: np.ndarray,
+    item_counts: dict[int, int],
+    alpha: float,
+    shrink: float = ITEM_SUPPORT_SHRINK,
+    min_mix: float = MIN_CONTENT_MIX,
+) -> dict[str, np.ndarray]:
+    """Return hybrid scores plus the per-movie mix weights used to make them."""
+    if len(content_scores) == 0:
+        empty = np.array([], dtype=float)
+        return {
+            "rating_count": empty,
+            "content_weight": empty,
+            "cf_weight": empty,
+            "hybrid_rating": empty,
+        }
+    counts = np.fromiter(
+        (item_counts.get(int(movie_id), 0) for movie_id in movie_ids),
+        dtype=float,
+        count=len(movie_ids),
+    )
+    item_confidence = counts / (counts + shrink)
+    content_weight = np.clip(
+        alpha * (min_mix + (1.0 - min_mix) * (1.0 - item_confidence)),
+        0.0,
+        1.0,
+    )
+    cf_weight = 1.0 - content_weight
+    hybrid_rating = np.clip(
+        content_weight * content_scores + cf_weight * cf_scores,
+        MIN_RATING,
+        MAX_RATING,
+    )
+    return {
+        "rating_count": counts,
+        "content_weight": content_weight,
+        "cf_weight": cf_weight,
+        "hybrid_rating": hybrid_rating,
+    }
+
+
 def blend_hybrid_scores(
     content_scores: np.ndarray,
     cf_scores: np.ndarray,
@@ -55,24 +98,163 @@ def blend_hybrid_scores(
     min_mix: float = MIN_CONTENT_MIX,
 ) -> np.ndarray:
     """Support-aware weighted hybrid: more content when a movie has few ratings."""
-    if len(content_scores) == 0:
-        return np.array([], dtype=float)
-    counts = np.fromiter(
-        (item_counts.get(int(movie_id), 0) for movie_id in movie_ids),
-        dtype=float,
-        count=len(movie_ids),
+    return blend_hybrid_details(
+        content_scores,
+        cf_scores,
+        movie_ids,
+        item_counts,
+        alpha,
+        shrink=shrink,
+        min_mix=min_mix,
+    )["hybrid_rating"]
+
+
+def blend_source_label(content_weight: float) -> str:
+    """Label whether content or SVD carried more of the hybrid score."""
+    if content_weight >= 0.45:
+        return "Content-leaning"
+    if content_weight <= 0.25:
+        return "Collaborative-leaning"
+    return "Balanced"
+
+
+def _hybrid_score_columns(frame: pd.DataFrame) -> tuple[str, str, str]:
+    content = "content_rating" if "content_rating" in frame.columns else "Content score"
+    collaborative = "cf_rating" if "cf_rating" in frame.columns else "Collaborative score"
+    hybrid = "hybrid_rating" if "hybrid_rating" in frame.columns else "Hybrid score"
+    return content, collaborative, hybrid
+
+
+def explain_blend_table_html(frame: pd.DataFrame, reasons: dict[int, list[str]]) -> str:
+    """Table explaining the content/SVD mix for each hybrid recommendation."""
+    from html import escape
+
+    from content_based import genre_pill_html, split_movie_genres
+
+    content_col, cf_col, hybrid_col = _hybrid_score_columns(frame)
+    rows_html: list[str] = []
+    for number, (_, row) in enumerate(frame.iterrows(), start=1):
+        movie_id = int(row["movieId"])
+        title = escape(str(row.get("title") or "Unknown title"))
+        genres = split_movie_genres(row.get("genres", ""))
+        pills = "".join(genre_pill_html(genre) for genre in genres) or (
+            '<span class="why-empty">No genres listed</span>'
+        )
+        content = float(row.get(content_col, 0.0) or 0.0)
+        cf_score = float(row.get(cf_col, 0.0) or 0.0)
+        hybrid_score = float(row.get(hybrid_col, 0.0) or 0.0)
+        genre_set = set(genres)
+        why_bits = [item for item in reasons.get(movie_id, []) if item not in genre_set]
+        why = "".join(
+            f'<div class="why-line">✓ {escape(item)}</div>' for item in why_bits
+        ) or '<span class="why-empty">Support-aware hybrid blend</span>'
+        rows_html.append(
+            "<tr>"
+            f"<td class='num'>{number}</td>"
+            f"<td class='title-cell'>{title}</td>"
+            f"<td class='genre-cell'>{pills}</td>"
+            f"<td class='score-cell content'>{content:.2f}</td>"
+            f"<td class='score-cell collab'>{cf_score:.2f}</td>"
+            f"<td class='score-cell hybrid'>{hybrid_score:.2f}</td>"
+            f"<td class='why-cell'>{why}</td>"
+            "</tr>"
+        )
+    return (
+        "<table class='why-table'>"
+        "<thead><tr>"
+        "<th>No.</th><th>Movie</th><th>Genres</th>"
+        "<th>Content</th><th>SVD</th><th>Hybrid</th>"
+        "<th>Why this mix?</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody></table>"
     )
-    item_confidence = counts / (counts + shrink)
-    effective_alpha = np.clip(
-        alpha * (min_mix + (1.0 - min_mix) * (1.0 - item_confidence)),
-        0.0,
-        1.0,
+
+
+def plot_score_breakdown(frame: pd.DataFrame):
+    """Grouped bars of content, SVD, and hybrid scores for the current list."""
+    import matplotlib.pyplot as plt
+
+    content_col, cf_col, hybrid_col = _hybrid_score_columns(frame)
+    labels = [
+        str(title)[:26] + ("…" if len(str(title)) > 26 else "")
+        for title in frame["title"].tolist()
+    ]
+    content = frame[content_col].astype(float).to_numpy()
+    collaborative = frame[cf_col].astype(float).to_numpy()
+    hybrid_scores = frame[hybrid_col].astype(float).to_numpy()
+    stacked = np.concatenate([content, collaborative, hybrid_scores])
+    y_min = max(0.0, float(np.nanmin(stacked)) - 0.2)
+    y_max = min(5.35, float(np.nanmax(stacked)) + 0.15)
+    if y_max - y_min < 0.7:
+        mid = (y_min + y_max) / 2
+        y_min = max(0.0, mid - 0.45)
+        y_max = min(5.35, mid + 0.45)
+
+    x = list(range(len(frame)))
+    width = 0.26
+    fig, ax = plt.subplots(figsize=(8.2, 4.0))
+    fig.patch.set_facecolor("#FFFFFF")
+    ax.set_facecolor("#FFFFFF")
+    ax.bar([pos - width for pos in x], content, width, label="Content", color="#5B8FF9")
+    ax.bar(x, collaborative, width, label="Collaborative (SVD)", color="#5AD8A6")
+    ax.bar([pos + width for pos in x], hybrid_scores, width, label="Hybrid", color="#E85D75")
+    ax.set_xticks(x, labels, rotation=28, ha="right")
+    ax.set_ylabel("Predicted rating (zoomed)")
+    ax.set_ylim(y_min, y_max)
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("#C5C9D3")
+    legend = ax.legend(
+        frameon=True,
+        fontsize=8,
+        ncol=3,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.14),
+        facecolor="#FFFFFF",
+        edgecolor="#D0D3DA",
     )
-    return np.clip(
-        effective_alpha * content_scores + (1.0 - effective_alpha) * cf_scores,
-        MIN_RATING,
-        MAX_RATING,
+    legend.get_frame().set_alpha(1)
+    fig.tight_layout()
+    return fig
+
+
+def plot_blend_weights(
+    alpha: float,
+    shrink: float = ITEM_SUPPORT_SHRINK,
+    min_mix: float = MIN_CONTENT_MIX,
+    max_count: int = 250,
+):
+    """How content vs SVD weight changes as a movie gets more ratings."""
+    import matplotlib.pyplot as plt
+
+    counts = np.arange(0, max_count + 1, dtype=int)
+    item_counts = {int(index): int(count) for index, count in enumerate(counts)}
+    details = blend_hybrid_details(
+        np.full(len(counts), 4.0),
+        np.full(len(counts), 4.0),
+        np.arange(len(counts)),
+        item_counts,
+        float(alpha),
+        shrink=shrink,
+        min_mix=min_mix,
     )
+    fig, ax = plt.subplots(figsize=(6.6, 3.2))
+    fig.patch.set_facecolor("#FFFFFF")
+    ax.set_facecolor("#FFFFFF")
+    ax.plot(counts, details["content_weight"], color="#5B8FF9", label="Content weight")
+    ax.plot(counts, details["cf_weight"], color="#5AD8A6", label="Collaborative weight")
+    ax.set_xlabel("Ratings the movie already has")
+    ax.set_ylabel("Blend weight")
+    ax.set_ylim(0, 1.05)
+    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    return fig
 
 
 class ContentBasedRecommender:
@@ -529,7 +711,7 @@ class HybridRecommender:
         movie_content: pd.DataFrame,
         movies: pd.DataFrame,
     ) -> "HybridRecommender":
-        self.content_model.fit(ratings, movie_content)
+        self.content_model.fit(ratings, movie_content, movies=movies)
         self.collaborative_model.fit(ratings)
         self.movies = movies
         self.item_counts = dict(self.collaborative_model.item_counts)
@@ -569,48 +751,256 @@ class HybridRecommender:
         )
         return float(blended[0])
 
-    def recommend(self, user_id: int, n_recommendations: int = 10) -> pd.DataFrame:
+    def _candidate_scores(self, user_id: int, n_recommendations: int = 10) -> pd.DataFrame:
+        """Score the union of content and collaborative candidate lists."""
         candidate_count = max(n_recommendations * 5, 50)
         content_candidates = self.content_model.top_candidates(user_id, candidate_count)
         cf_candidates = self.collaborative_model.top_candidates(user_id, candidate_count)
         candidate_movie_ids = list(dict.fromkeys(content_candidates + cf_candidates))
-
         if not candidate_movie_ids:
             raise ValueError(f"Unable to generate candidates for user {user_id}.")
 
-        hybrid = pd.DataFrame(
-            {
-                "movieId": candidate_movie_ids,
-                "content_rating": [
-                    self.content_model.predict(user_id, movie_id)
-                    for movie_id in candidate_movie_ids
-                ],
-                "cf_rating": [
-                    self.collaborative_model.predict(user_id, movie_id)
-                    for movie_id in candidate_movie_ids
-                ],
-            }
+        content_scores = np.array(
+            [self.content_model.predict(user_id, movie_id) for movie_id in candidate_movie_ids],
+            dtype=float,
         )
-        hybrid["hybrid_rating"] = blend_hybrid_scores(
-            hybrid["content_rating"].to_numpy(dtype=float),
-            hybrid["cf_rating"].to_numpy(dtype=float),
-            hybrid["movieId"].to_numpy(),
+        cf_scores = np.array(
+            [self.collaborative_model.predict(user_id, movie_id) for movie_id in candidate_movie_ids],
+            dtype=float,
+        )
+        details = blend_hybrid_details(
+            content_scores,
+            cf_scores,
+            np.array(candidate_movie_ids),
             self.item_counts,
             self.alpha,
             shrink=self.item_shrink,
             min_mix=self.min_content_mix,
         )
-
-        recommendations = hybrid.sort_values("hybrid_rating", ascending=False).head(
-            n_recommendations
+        scored = pd.DataFrame(
+            {
+                "movieId": candidate_movie_ids,
+                "content_rating": content_scores,
+                "cf_rating": cf_scores,
+                "hybrid_rating": details["hybrid_rating"],
+                "rating_count": details["rating_count"].astype(int),
+                "content_weight": details["content_weight"],
+                "cf_weight": details["cf_weight"],
+                "from_content": np.isin(candidate_movie_ids, content_candidates),
+                "from_collaborative": np.isin(candidate_movie_ids, cf_candidates),
+            }
         )
+        scored["blend_source"] = [
+            blend_source_label(float(weight)) for weight in scored["content_weight"]
+        ]
         if self.movies is not None:
-            recommendations = recommendations.merge(
+            scored = scored.merge(
                 self.movies[["movieId", "title", "genres"]],
                 on="movieId",
                 how="left",
             )
-        return recommendations.reset_index(drop=True)
+        return scored
+
+    def recommend(self, user_id: int, n_recommendations: int = 10) -> pd.DataFrame:
+        scored = self._candidate_scores(user_id, n_recommendations=n_recommendations)
+        return (
+            scored.sort_values("hybrid_rating", ascending=False)
+            .head(n_recommendations)
+            .reset_index(drop=True)
+        )
+
+    def candidate_overlap(self, user_id: int, n_recommendations: int = 10) -> dict[str, int]:
+        """How the content and SVD candidate pools overlap for this user."""
+        scored = self._candidate_scores(user_id, n_recommendations=n_recommendations)
+        recs = scored.sort_values("hybrid_rating", ascending=False).head(n_recommendations)
+        return {
+            "content_candidates": int(scored["from_content"].sum()),
+            "collaborative_candidates": int(scored["from_collaborative"].sum()),
+            "in_both_pools": int((scored["from_content"] & scored["from_collaborative"]).sum()),
+            "recs_from_both": int((recs["from_content"] & recs["from_collaborative"]).sum()),
+            "recs_content_only": int((recs["from_content"] & ~recs["from_collaborative"]).sum()),
+            "recs_collaborative_only": int((recs["from_collaborative"] & ~recs["from_content"]).sum()),
+        }
+
+    def score_disagreements(self, user_id: int, n_movies: int = 8) -> pd.DataFrame:
+        """Movies where content and SVD scores differ the most."""
+        scored = self._candidate_scores(user_id, n_recommendations=max(n_movies, 10))
+        scored = scored.copy()
+        scored["score_gap"] = (scored["content_rating"] - scored["cf_rating"]).abs()
+        scored["favored_by"] = np.where(
+            scored["content_rating"] >= scored["cf_rating"],
+            "Content",
+            "Collaborative",
+        )
+        return scored.sort_values("score_gap", ascending=False).head(n_movies).reset_index(drop=True)
+
+    def recommendation_reasons(self, row: pd.Series, user_id: int | None = None) -> list[str]:
+        """Short notes explaining why this hybrid recommendation was mixed this way."""
+        count = int(row.get("rating_count", 0) or 0)
+        content_weight = float(row.get("content_weight", 0.5) or 0.5)
+        content_score = float(row.get("content_rating", row.get("Content score", 0.0)) or 0.0)
+        cf_score = float(row.get("cf_rating", row.get("Collaborative score", 0.0)) or 0.0)
+        source = str(row.get("blend_source", blend_source_label(content_weight)))
+        reasons: list[str] = []
+        if user_id is not None:
+            if getattr(self.content_model, "movies", None) is None:
+                self.content_model.movies = self.movies
+            if hasattr(self.content_model, "recommendation_reasons"):
+                reasons.extend(
+                    self.content_model.recommendation_reasons(
+                        int(user_id), int(row["movieId"])
+                    )[:4]
+                )
+        reasons.append(f"{source}: {content_weight:.0%} content / {1.0 - content_weight:.0%} SVD")
+        if count <= 15:
+            reasons.append(f"Rarely rated ({count} ratings), so content has more influence")
+        elif count >= 120:
+            reasons.append(f"Popular movie ({count} ratings), so SVD has more influence")
+        else:
+            reasons.append(f"{count} ratings in the training data")
+        gap = content_score - cf_score
+        if gap >= 0.35:
+            reasons.append(
+                f"Content likes it more ({content_score:.2f} vs SVD {cf_score:.2f})"
+            )
+        elif gap <= -0.35:
+            reasons.append(
+                f"People like you like it more (SVD {cf_score:.2f} vs content {content_score:.2f})"
+            )
+        return reasons
+
+    def search_movies(
+        self,
+        query: str = "",
+        genres: list[str] | tuple[str, ...] | None = None,
+        limit: int = 25,
+    ) -> pd.DataFrame:
+        """Find catalog movies by title and/or genre."""
+        if self.movies is None:
+            raise RuntimeError("Movies catalog is not loaded.")
+        text = query.strip()
+        wanted = [str(genre).strip() for genre in (genres or []) if str(genre).strip()]
+        columns = [column for column in ("movieId", "title", "genres", "year") if column in self.movies.columns]
+        catalog = self.movies[columns]
+        if not text and not wanted:
+            return catalog.head(0)
+
+        mask = pd.Series(True, index=catalog.index)
+        if text:
+            mask &= catalog["title"].str.contains(text, case=False, na=False, regex=False)
+        for genre in wanted:
+            mask &= catalog["genres"].str.contains(genre, case=False, na=False, regex=False)
+        return catalog.loc[mask].head(limit).reset_index(drop=True)
+
+    def score_movie(self, user_id: int, movie_id: int) -> pd.DataFrame:
+        """Hybrid content/SVD breakdown for one searched movie and the current user."""
+        content_score = float(self.content_model.predict(int(user_id), int(movie_id)))
+        cf_score = float(self.collaborative_model.predict(int(user_id), int(movie_id)))
+        details = blend_hybrid_details(
+            np.array([content_score]),
+            np.array([cf_score]),
+            np.array([int(movie_id)]),
+            self.item_counts,
+            self.alpha,
+            shrink=self.item_shrink,
+            min_mix=self.min_content_mix,
+        )
+        your_rating = self.content_model.user_ratings.get(int(user_id), {}).get(int(movie_id))
+        row = {
+            "movieId": int(movie_id),
+            "content_rating": content_score,
+            "cf_rating": cf_score,
+            "hybrid_rating": float(details["hybrid_rating"][0]),
+            "rating_count": int(details["rating_count"][0]),
+            "content_weight": float(details["content_weight"][0]),
+            "cf_weight": float(details["cf_weight"][0]),
+            "blend_source": blend_source_label(float(details["content_weight"][0])),
+            "your_rating": your_rating,
+        }
+        scored = pd.DataFrame([row])
+        if self.movies is not None:
+            scored = scored.merge(
+                self.movies[["movieId", "title", "genres"]],
+                on="movieId",
+                how="left",
+            )
+        return scored
+
+    def similar_to_movie(
+        self,
+        user_id: int,
+        movie_id: int,
+        n_recommendations: int = 10,
+    ) -> pd.DataFrame:
+        """Unseen movies with similar content, ranked by the hybrid score."""
+        content = self.content_model
+        if content.tfidf_matrix is None or content.movie_ids is None:
+            raise RuntimeError("Content model is not fitted.")
+        seed_index = content.movie_id_to_index.get(int(movie_id))
+        if seed_index is None:
+            raise ValueError("That movie is not in the content catalog.")
+
+        similarities = content.tfidf_matrix @ content.tfidf_matrix[seed_index]
+        seen = set(content.user_ratings.get(int(user_id), {}))
+        seen.add(int(movie_id))
+        ranked = np.argsort(similarities)[::-1]
+        picked: list[int] = []
+        sim_values: list[float] = []
+        pool_size = max(n_recommendations * 4, 40)
+        for index in ranked:
+            other_id = int(content.movie_ids[index])
+            if other_id in seen:
+                continue
+            picked.append(other_id)
+            sim_values.append(float(similarities[index]))
+            if len(picked) >= pool_size:
+                break
+        if not picked:
+            raise ValueError("No similar unseen movies found for that title.")
+
+        content_scores = np.array(
+            [self.content_model.predict(int(user_id), other_id) for other_id in picked],
+            dtype=float,
+        )
+        cf_scores = np.array(
+            [self.collaborative_model.predict(int(user_id), other_id) for other_id in picked],
+            dtype=float,
+        )
+        details = blend_hybrid_details(
+            content_scores,
+            cf_scores,
+            np.array(picked),
+            self.item_counts,
+            self.alpha,
+            shrink=self.item_shrink,
+            min_mix=self.min_content_mix,
+        )
+        similar = pd.DataFrame(
+            {
+                "movieId": picked,
+                "similarity": sim_values,
+                "content_rating": content_scores,
+                "cf_rating": cf_scores,
+                "hybrid_rating": details["hybrid_rating"],
+                "rating_count": details["rating_count"].astype(int),
+                "content_weight": details["content_weight"],
+                "cf_weight": details["cf_weight"],
+            }
+        )
+        similar["blend_source"] = [
+            blend_source_label(float(weight)) for weight in similar["content_weight"]
+        ]
+        if self.movies is not None:
+            similar = similar.merge(
+                self.movies[["movieId", "title", "genres"]],
+                on="movieId",
+                how="left",
+            )
+        return (
+            similar.sort_values(["hybrid_rating", "similarity"], ascending=False)
+            .head(n_recommendations)
+            .reset_index(drop=True)
+        )
 
     def predict(self, user_id: int, movie_id: int) -> float:
         """Predict a hybrid rating for one user-movie pair."""
