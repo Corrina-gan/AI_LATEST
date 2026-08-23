@@ -1022,7 +1022,7 @@ def demo(
         diversity=diversity,
     )
 
-#Command-Line Arguments = Allow you to control the recommender from the terminal.
+#Command-Line Arguments = Allow you to control the recommender from the terminal
 def parse_args() -> argparse.Namespace:
     #default = If the user doesn't tell me what to use, use this value
     parser = argparse.ArgumentParser(description="Run the content-based recommender.")
