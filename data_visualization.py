@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
 
 from data_preprocessing import PROCESSED_DIR, preprocess_dataset
 
@@ -211,49 +213,11 @@ def make_ratings_over_time(ratings: pd.DataFrame) -> plt.Figure:
     return fig
 
 
-_DONUT_FILLED = "#0984e3"
-_DONUT_EMPTY = "#dfe6e9"
-_PARETO_BAR = "#2c3e50"
-_PARETO_LINE = "#e67e22"
-
-
-def make_matrix_sparsity_donut(ratings: pd.DataFrame) -> plt.Figure:
-    """Filled vs empty cells in the user–item rating matrix."""
-    matrix = ratings.pivot_table(index="userId", columns="movieId", values="rating")
-    total_cells = int(matrix.shape[0] * matrix.shape[1])
-    filled_cells = int(matrix.notna().sum().sum())
-    empty_cells = total_cells - filled_cells
-    filled_pct = 100.0 * filled_cells / total_cells if total_cells else 0.0
-
-    fig, ax = _white_figure((5.0, 2.6))
-    wedges, _ = ax.pie(
-        [filled_cells, empty_cells],
-        colors=[_DONUT_FILLED, _DONUT_EMPTY],
-        startangle=90,
-        counterclock=False,
-        wedgeprops={"width": 0.42, "edgecolor": "white", "linewidth": 2},
-    )
-    ax.text(
-        0,
-        0.1,
-        f"{filled_pct:.1f}%",
-        ha="center",
-        va="center",
-        fontsize=16,
-        fontweight="bold",
-        color=_DONUT_FILLED,
-    )
-    ax.text(0, -0.15, "filled", ha="center", va="center", fontsize=8, color="dimgray")
-    ax.legend(
-        wedges,
-        [f"Filled ({filled_pct:.1f}%)", f"Empty ({100 - filled_pct:.1f}%)"],
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        frameon=False,
-        fontsize=8,
-    )
-    fig.tight_layout()
-    return fig
+_SPARSITY_FILLED = "#0984e3"
+_SPARSITY_EMPTY = "#dfe6e9"
+_MOVIE_HIST_COLOR = "#2c3e50"
+_COLDSTART_BELOW = "#E85D75"
+_COLDSTART_ABOVE = "#5AD8A6"
 
 
 def sparsity_stats(ratings: pd.DataFrame) -> tuple[float, int, int]:
@@ -263,76 +227,98 @@ def sparsity_stats(ratings: pd.DataFrame) -> tuple[float, int, int]:
     return filled_pct, n_users, n_movies
 
 
-def make_long_tail_pareto(ratings: pd.DataFrame) -> tuple[plt.Figure, float, float]:
-    """Movie popularity rank vs ratings, with an 80% cumulative curve."""
-    counts = ratings.groupby("movieId").size().sort_values(ascending=False)
-    total_movies = len(counts)
-    total_ratings = int(counts.sum())
-    ranks = np.arange(1, total_movies + 1)
-    cum_pct = counts.cumsum() / total_ratings * 100
-    pct_le5 = float((counts <= 5).mean() * 100)
-    n_to_80 = int((cum_pct < 80).sum() + 1)
-    pct_movies_to_80 = n_to_80 / total_movies * 100
+def make_matrix_sparsity_heatmap(
+    ratings: pd.DataFrame,
+    n_users: int = 80,
+    n_movies: int = 80,
+    seed: int = 42,
+) -> plt.Figure:
+    """1.8 Rated vs unrated cells in a random sample of the user-item matrix."""
+    rng = np.random.default_rng(seed)
+    user_ids = ratings["userId"].unique()
+    movie_ids = ratings["movieId"].unique()
+    sampled_users = rng.choice(user_ids, size=min(n_users, len(user_ids)), replace=False)
+    sampled_movies = rng.choice(movie_ids, size=min(n_movies, len(movie_ids)), replace=False)
 
-    fig, ax1 = _white_figure((6.4, 2.8))
-    ax1.bar(ranks, counts.values, width=1.0, color=_PARETO_BAR, alpha=0.75)
-    ax1.set_yscale("log")
-    ax1.set_xlabel("Movie rank (most-rated first)", fontsize=9)
-    ax1.set_ylabel("Ratings / movie (log)", color=_PARETO_BAR, fontsize=9)
-    ax1.tick_params(axis="y", labelcolor=_PARETO_BAR)
+    subset = ratings.loc[
+        ratings["userId"].isin(sampled_users) & ratings["movieId"].isin(sampled_movies)
+    ]
+    matrix = subset.pivot_table(index="userId", columns="movieId", values="rating")
+    matrix = matrix.reindex(index=sampled_users, columns=sampled_movies)
+    binary = matrix.notna().astype(int)
 
-    ax2 = ax1.twinx()
-    ax2.set_facecolor("none")
-    ax2.plot(ranks, cum_pct.values, color=_PARETO_LINE, linewidth=2)
-    ax2.set_ylabel("Cumulative % of ratings", color=_PARETO_LINE, fontsize=9)
-    ax2.tick_params(axis="y", labelcolor=_PARETO_LINE)
-    ax2.set_ylim(0, 105)
-    ax2.axhline(80, color=_PARETO_LINE, linestyle="--", linewidth=1, alpha=0.6)
-    ax2.axvline(n_to_80, color=_PARETO_LINE, linestyle="--", linewidth=1, alpha=0.6)
-    ax2.annotate(
-        f"{pct_movies_to_80:.1f}% of movies\n= 80% of ratings",
-        xy=(n_to_80, 80),
-        xytext=(n_to_80 + total_movies * 0.1, 50),
+    fig, ax = _white_figure((6.4, 5.6))
+    cmap = ListedColormap([_SPARSITY_EMPTY, _SPARSITY_FILLED])
+    ax.imshow(binary.values, cmap=cmap, aspect="auto", interpolation="none")
+    ax.set_title("User-item matrix sparsity (sampled)")
+    ax.set_xlabel(f"{len(sampled_movies)} sampled movies")
+    ax.set_ylabel(f"{len(sampled_users)} sampled users")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.legend(
+        handles=[
+            Patch(facecolor=_SPARSITY_FILLED, label="Rated"),
+            Patch(facecolor=_SPARSITY_EMPTY, edgecolor="#c7ccd4", label="Unrated"),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.05),
+        ncol=2,
+        frameon=False,
         fontsize=8,
-        color=_PARETO_LINE,
-        arrowprops={"arrowstyle": "->", "color": _PARETO_LINE, "lw": 1},
     )
-    fig.tight_layout()
-    return fig, pct_movies_to_80, pct_le5
-
-
-def make_genre_decade_heatmap(ratings: pd.DataFrame, movies: pd.DataFrame) -> plt.Figure:
-    """Average rating by genre and release decade."""
-    work = ratings.merge(movies[["movieId", "genres", "year"]], on="movieId", how="inner")
-    work = work.dropna(subset=["genres", "year", "rating"]).copy()
-    work["decade"] = (work["year"].astype(int) // 10 * 10).astype(str) + "s"
-    work = work.assign(genre=work["genres"].str.split("|")).explode("genre")
-    work["genre"] = work["genre"].astype(str).str.strip()
-    work = work.loc[work["genre"].ne("(no genres listed)") & work["genre"].ne("")]
-    top_genres = work["genre"].value_counts().head(10).index
-    work = work.loc[work["genre"].isin(top_genres)]
-    pivot = work.pivot_table(index="genre", columns="decade", values="rating", aggfunc="mean")
-    pivot = pivot.reindex(sorted(pivot.columns, key=lambda decade: int(decade[:-1])), axis=1)
-    pivot = pivot.loc[pivot.mean(axis=1).sort_values(ascending=False).index]
-
-    fig, ax = _white_figure((6.6, 3.4))
-    sns.heatmap(
-        pivot,
-        annot=True,
-        fmt=".1f",
-        cmap="YlGnBu",
-        vmin=1.5,
-        annot_kws={"size": 7, "fontweight": "bold"},
-        linewidths=0.4,
-        linecolor="white",
-        cbar_kws={"label": "Avg. rating"},
-        ax=ax,
-    )
-    ax.set_xlabel("Release decade")
-    ax.set_ylabel("Genre")
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
     fig.tight_layout()
     return fig
+
+
+def make_ratings_per_movie_distribution(ratings: pd.DataFrame) -> plt.Figure:
+    """1.9 How many ratings each movie receives, on a log-scaled y-axis."""
+    movie_counts = ratings.groupby("movieId").size()
+    fig, ax = _white_figure((6.4, 3.2))
+    sns.histplot(movie_counts, bins=40, color=_MOVIE_HIST_COLOR, ax=ax)
+    ax.set_yscale("log")
+    ax.set_title("Distribution of ratings per movie")
+    ax.set_xlabel("Number of ratings received")
+    ax.set_ylabel("Number of movies (log scale)")
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    return fig
+
+
+def make_coldstart_segment_bars(
+    ratings: pd.DataFrame,
+    threshold: int = 5,
+) -> tuple[plt.Figure, float, float]:
+    """1.10 Share of users and movies with too few ratings for reliable recommendations."""
+    user_counts = ratings.groupby("userId").size()
+    movie_counts = ratings.groupby("movieId").size()
+    pct_users_below = float((user_counts <= threshold).mean() * 100)
+    pct_movies_below = float((movie_counts <= threshold).mean() * 100)
+    below_pct = [pct_users_below, pct_movies_below]
+    above_pct = [100 - pct for pct in below_pct]
+
+    fig, ax = _white_figure((6.0, 3.2))
+    entities = ["Users", "Movies"]
+    x = np.arange(len(entities))
+    width = 0.35
+    ax.bar(
+        x - width / 2,
+        below_pct,
+        width,
+        label=f"≤ {threshold} ratings (cold-start)",
+        color=_COLDSTART_BELOW,
+    )
+    ax.bar(x + width / 2, above_pct, width, label=f"> {threshold} ratings", color=_COLDSTART_ABOVE)
+    ax.set_xticks(x)
+    ax.set_xticklabels(entities)
+    ax.set_ylim(0, 105)
+    ax.set_ylabel("Share (%)")
+    ax.set_title(f"Cold-start segment size (threshold = {threshold} ratings)")
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    fig.tight_layout()
+    return fig, pct_users_below, pct_movies_below
 
 
 def plot_rating_distribution(ratings: pd.DataFrame, output_dir: Path) -> Path:

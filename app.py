@@ -1551,26 +1551,42 @@ def render_visualization(data_sig: str, ratings, movies) -> None:
     st.caption("How many ratings were submitted in each year.")
     st.pyplot(data_visualization.make_ratings_over_time(ratings), clear_figure=True, width="content")
 
-    st.markdown("#### Collaborative filtering context")
+    st.markdown("#### 1.8 User-Item Matrix Sparsity")
     st.caption(
-        "These charts show why collaborative filtering is needed: the rating matrix is "
-        "mostly empty, and a small set of popular movies accounts for most ratings."
+        "How much of the ratings matrix is empty, showing why collaborative filtering "
+        "must handle sparse data."
     )
-    st.markdown("**User–item matrix sparsity**")
-    st.pyplot(data_visualization.make_matrix_sparsity_donut(ratings), clear_figure=True, width="content")
-    st.markdown("**Long-tail popularity**")
-    pareto_fig, pct_to_80, pct_le5 = data_visualization.make_long_tail_pareto(ratings)
-    st.pyplot(pareto_fig, clear_figure=True, width="content")
-    st.caption(
-        f"{pct_to_80:.1f}% of movies account for 80% of ratings. "
-        f"{pct_le5:.1f}% of movies have 5 or fewer ratings."
-    )
-    st.markdown("**Average rating by genre and decade**")
-    st.caption("Top 10 most-rated genres. Blank cells mean no rated movies in that decade.")
+    filled_pct, _n_users, _n_movies = data_visualization.sparsity_stats(ratings)
+    st.caption(f"**{100 - filled_pct:.1f}%** of the user-item matrix is empty.")
     st.pyplot(
-        data_visualization.make_genre_decade_heatmap(ratings, movies),
+        data_visualization.make_matrix_sparsity_heatmap(ratings),
         clear_figure=True,
         width="content",
+    )
+
+    st.markdown("#### 1.9 Distribution of Ratings per Movie")
+    st.caption(
+        "How many ratings each movie receives, showing a small number of popular movies "
+        "versus a long tail of rarely-rated ones."
+    )
+    st.pyplot(
+        data_visualization.make_ratings_per_movie_distribution(ratings),
+        clear_figure=True,
+        width="content",
+    )
+
+    st.markdown("#### 1.10 Cold-Start Segment Size")
+    st.caption(
+        "The proportion of users and movies with too few ratings to support reliable "
+        "recommendations."
+    )
+    coldstart_fig, pct_users_below, pct_movies_below = data_visualization.make_coldstart_segment_bars(
+        ratings
+    )
+    st.pyplot(coldstart_fig, clear_figure=True, width="content")
+    st.caption(
+        f"{pct_users_below:.1f}% of users and {pct_movies_below:.1f}% of movies fall "
+        "in the cold-start segment."
     )
 
 
