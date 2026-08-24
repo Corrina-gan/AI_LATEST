@@ -1,11 +1,10 @@
 """
-Collaborative Filtering engine for the Movie Recommender assignment.
+Collaborative Filtering for the Movie Recommender System
 
 Model variants:
-1. User-based CF   -> cosine similarity between user rating vectors.
-2. Item-based CF    -> cosine, or adjusted-cosine ("Pearson-style"),
-                       similarity between item rating vectors.
-3. Matrix factorization -> TruncatedSVD on the mean-centered rating matrix.
+1. User-based CF        -> cosine similarity between user rating vectors
+2. Item-based CF        -> cosine, or adjusted-cosine ("Pearson-style"), similarity between item rating vectors
+3. Matrix factorization -> TruncatedSVD on the mean-centered rating matrix
 """
 
 from __future__ import annotations
@@ -26,10 +25,13 @@ from sklearn.metrics import (
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 
+# Constants
 BASE_DIR = Path(__file__).resolve().parent
 MIN_RATING = 0.5
 MAX_RATING = 5.0
 ALGORITHM_KEY = "collaborative"
+
+# Internal short codes for the three CF variants 
 VARIANT_USER = "user"
 VARIANT_ITEM = "item"
 VARIANT_SVD = "svd"
@@ -38,17 +40,21 @@ VARIANT_OPTIONS = {
     "Item-Based CF": VARIANT_ITEM,
     "Matrix Factorization (SVD)": VARIANT_SVD,
 }
+
+# Item-based CF supports two similarity metrics
 ITEM_METHOD_COSINE = "cosine"
 ITEM_METHOD_PEARSON = "pearson"
 ITEM_METHOD_OPTIONS = {
     "Cosine": ITEM_METHOD_COSINE,
     "Pearson (adjusted cosine)": ITEM_METHOD_PEARSON,
 }
-DEFAULT_NEIGHBORHOOD_K = 30
-DEFAULT_N_COMPONENTS = 20
+
+DEFAULT_NEIGHBORHOOD_K = 30                 # how many similar users/items to use in kNN-style prediction
+DEFAULT_N_COMPONENTS = 20                   # number of latent factors for SVD
 DEFAULT_ITEM_METHOD = ITEM_METHOD_COSINE
-# Filled by render_controls() so recommend() still sees item-method / SVD
-# knobs even when the app only passes variant, k, and genres.
+
+# Module-level fallback so recommend() still has sensible item-method / SVD
+# settings even if only variant/k/genres were passed in
 _LAST_CONTROLS: dict[str, object] = {
     "item_method": DEFAULT_ITEM_METHOD,
     "n_components": DEFAULT_N_COMPONENTS,
@@ -56,10 +62,14 @@ _LAST_CONTROLS: dict[str, object] = {
 
 
 def _split_genres(value: object) -> list[str]:
+    '''Split a genre string into a list of individual genres, 
+    dropping the placeholder (no genres listed)'''
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return []
     text = str(value)
     if text.startswith("["):
+        # Handle the case where genres were stored as a Python list literal
+        # (e.g. "['Action', 'Comedy']") rather than a pipe-separated string.
         try:
             import ast
 
@@ -74,12 +84,14 @@ def _split_genres(value: object) -> list[str]:
         if part.strip() and part.strip() != "(no genres listed)"
     ]
 
-
+#Keep a predicted rating inside the valid 0.5-5.0 scale
 def _clip_rating(value: float) -> float:
     return float(np.clip(value, MIN_RATING, MAX_RATING))
 
 
 def _find_processed_dir() -> Path:
+    """Locate the folder containing the cleaned/preprocessed CSVs, checking
+    a couple of likely locations relative to this file."""
     for candidate in (BASE_DIR / "processed", BASE_DIR / "dataset" / "processed"):
         if (candidate / "ratings_clean.csv").exists():
             return candidate
@@ -106,35 +118,52 @@ class CollaborativeFiltering:
         recs = cf.recommend(user_id=1, variant=cf.MODEL_USER_BASED, n_recommendations=10)
     """
 
+    # Valid rating range and tunable thresholds used across the model
     RATING_MIN, RATING_MAX = MIN_RATING, MAX_RATING
-    COLD_START_MIN_RATINGS = 5
-    MIN_ITEM_RATING_COUNT = 5
-    MIN_PREDICTION_SUPPORT = 2
-    POPULARITY_PRIOR_VOTES = 10
+    COLD_START_MIN_RATINGS = 5       # users below this many ratings get the popularity fallback
+    MIN_ITEM_RATING_COUNT = 5        # movies below this many ratings are excluded from item similarity
 
+    MIN_PREDICTION_SUPPORT = 2       # need at least this many contributing neighbors to trust a prediction
+
+    POPULARITY_PRIOR_VOTES = 10       # "virtual votes" added in the Bayesian popularity average
+
+    # Display labels for each model variant
     MODEL_USER_BASED = "User-Based CF"
     MODEL_ITEM_BASED = "Item-Based CF"
     MODEL_SVD = "Matrix Factorization (SVD)"
     MODELS = [MODEL_USER_BASED, MODEL_ITEM_BASED, MODEL_SVD]
 
     def __init__(self, n_factors: int = DEFAULT_N_COMPONENTS) -> None:
+        # Number of latent factors used by the default SVD model instance.
         self.n_factors = int(n_factors)
+
+        # Populated by fit(): raw data + lookup tables.
         self.ratings_df: pd.DataFrame | None = None
         self.movies: pd.DataFrame | None = None
         self.movie_lookup: pd.DataFrame | None = None
+
+        # The user-item matrices: one with NaN for unrated cells, one with 0.0 for unrated cells (used for similarity/SVD)
         self.ratings_matrix: pd.DataFrame | None = None
         self.filled_matrix: pd.DataFrame | None = None
+
         self.user_ids: np.ndarray | None = None
         self.movie_ids: np.ndarray | None = None
         self.user_id_to_index: dict[int, int] = {}
         self.movie_id_to_index: dict[int, int] = {}
+
+        # Per-user quick-lookup structures used for cold-start checks, excluding already-rated movies, and explanation generation
         self.user_train_movies: dict[int, set[int]] = {}
         self.user_train_ratings: dict[int, dict[int, float]] = {}
         self.movie_genre_sets: dict[int, set[str]] = {}
+
+        # Caches so repeated calls don't recompute expensive similarity
+        # SVD matrices. Cleared whenever fit() is called again
         self.global_mean: float = 3.5
         self._user_similarity: pd.DataFrame | None = None
         self._item_similarity_cache: dict[str, pd.DataFrame] = {}
         self._svd_cache: dict[int, pd.DataFrame] = {}
+
+        # State from the most recent recommend() call, used to build human-readable explanations and to report which strategy was used
         self._popular_movies_cache: pd.DataFrame | None = None
         self._last_scores: pd.DataFrame | None = None
         self.last_is_cold_start = False
@@ -150,12 +179,15 @@ class CollaborativeFiltering:
         if missing:
             raise ValueError(f"ratings is missing required columns: {missing}")
 
+        # Drop incomplete rows and enforce expected dtypes.
         self.ratings_df = ratings.dropna(subset=["userId", "movieId", "rating"]).copy()
         self.ratings_df["userId"] = self.ratings_df["userId"].astype(int)
         self.ratings_df["movieId"] = self.ratings_df["movieId"].astype(int)
         self.ratings_df["rating"] = self.ratings_df["rating"].astype(float)
         self.movies = movies
         self.global_mean = float(self.ratings_df["rating"].mean())
+
+        # Build the user x movie ratings matrix (NaN + zero-filled versions)
         self.ratings_matrix, self.filled_matrix = self.build_user_item_matrix(self.ratings_df)
         self.user_ids = self.ratings_matrix.index.to_numpy()
         self.movie_ids = self.ratings_matrix.columns.to_numpy()
@@ -166,6 +198,9 @@ class CollaborativeFiltering:
             int(movie_id): index for index, movie_id in enumerate(self.movie_ids)
         }
 
+        '''Build a movieId -> (title, genres, year) lookup table, preferring
+           the movies table if given, otherwise falling back to whatever
+           title/genres columns exist on the ratings frame itself'''
         lookup_source = movies if movies is not None else self.ratings_df
         lookup_cols = [column for column in ("movieId", "title", "genres", "year") if column in lookup_source.columns]
         if "movieId" not in lookup_cols:
@@ -202,16 +237,18 @@ class CollaborativeFiltering:
 
     @staticmethod
     def build_user_item_matrix(ratings_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Pivot to a (userId x movieId) matrix.
+        """Pivot to a (userId x movieId) matrix
 
         Returns:
-            ratings_matrix: NaN where a user hasn't rated a movie.
-            filled_matrix:  unrated cells filled with 0 (needed for similarity / SVD).
+            ratings_matrix: NaN where a user hasn't rated a movie
+            filled_matrix:  unrated cells filled with 0 (needed for similarity / SVD)
         """
         ratings_matrix = ratings_df.pivot_table(index="userId", columns="movieId", values="rating")
         filled_matrix = ratings_matrix.fillna(0.0)
         return ratings_matrix, filled_matrix
 
+    """Percentage of user-movie cells that are NOT rated (i.e. how
+        sparse the ratings matrix is). Used in the EDA section."""
     @staticmethod
     def matrix_sparsity(ratings_matrix: pd.DataFrame) -> float:
         total_cells = ratings_matrix.shape[0] * ratings_matrix.shape[1]
@@ -220,6 +257,8 @@ class CollaborativeFiltering:
         filled_cells = int(ratings_matrix.notna().sum().sum())
         return 100.0 * (1 - filled_cells / total_cells)
 
+    """Return every distinct genre label present in the movie catalog,
+        used to populate the genre-filter dropdown in the UI."""
     def get_all_genres(self) -> list[str]:
         labels: set[str] = set()
         for genres in (self.movie_lookup["genres"] if self.movie_lookup is not None else []):
@@ -230,6 +269,7 @@ class CollaborativeFiltering:
         """Cosine similarity between every pair of users' rating vectors."""
         _, filled_matrix, _ = self._require_fit()
         if self._user_similarity is None:
+            # User-user cosine similarity
             sim = cosine_similarity(filled_matrix.to_numpy())
             self._user_similarity = pd.DataFrame(
                 sim, index=filled_matrix.index, columns=filled_matrix.index
@@ -253,15 +293,20 @@ class CollaborativeFiltering:
         method: str,
         min_rating_count: int,
     ) -> pd.DataFrame:
+        """Compute the item-item similarity matrix, restricted to movies
+        with at least `min_rating_count` ratings (too-sparse movies would
+        give unreliable similarity scores)."""
         rating_counts = ratings_matrix.notna().sum(axis=0)
         eligible_movies = rating_counts[rating_counts >= min_rating_count].index
         sub_filled = filled_matrix[eligible_movies]
         if method == ITEM_METHOD_PEARSON:
+            # Adjusted cosine: subtract each movie's own mean rating first, so similarity reflects rating *pattern* rather than raw level
             item_means = ratings_matrix[eligible_movies].mean(axis=0).fillna(0.0)
             rated_mask = ratings_matrix[eligible_movies].notna()
             centered = (sub_filled - item_means).where(rated_mask, 0.0)
             sim = cosine_similarity(centered.to_numpy().T)
         else:
+            # Plain cosine similarity on raw (zero-filled) rating vectors
             sim = cosine_similarity(sub_filled.to_numpy().T)
         return pd.DataFrame(sim, index=eligible_movies, columns=eligible_movies)
 
@@ -279,14 +324,19 @@ class CollaborativeFiltering:
     def _fit_svd(
         cls, ratings_matrix: pd.DataFrame, filled_matrix: pd.DataFrame, n_components: int
     ) -> pd.DataFrame:
+        '''Center the matrix by each user's average rating (removes
+        generous/harsh-rater bias), factorize with TruncatedSVD, then
+        reconstruct predicted ratings by adding the user mean back.'''
         global_mean = float(ratings_matrix.stack().mean())
         user_means = ratings_matrix.mean(axis=1, skipna=True).fillna(global_mean)
         rated_mask = ratings_matrix.notna()
+
         centered = filled_matrix.sub(user_means, axis=0).where(rated_mask, 0.0)
         n_components = max(1, min(n_components, min(centered.shape) - 1))
         svd = TruncatedSVD(n_components=n_components, random_state=42)
         u_factors = svd.fit_transform(centered.to_numpy())
         reconstructed = u_factors @ svd.components_
+
         predicted = reconstructed + user_means.to_numpy().reshape(-1, 1)
         predicted = np.clip(predicted, cls.RATING_MIN, cls.RATING_MAX)
         return pd.DataFrame(predicted, index=filled_matrix.index, columns=filled_matrix.columns)
@@ -299,12 +349,15 @@ class CollaborativeFiltering:
         user_similarity = self.user_similarity()
         user_means = ratings_matrix.mean(axis=1, skipna=True)
         target_mean = float(user_means.loc[user_id])
+
+        # Pick the top-k most similar users
         sims = user_similarity.loc[user_id].drop(index=user_id, errors="ignore")
         top_neighbors = sims.sort_values(ascending=False).head(int(k_neighbors))
         top_neighbors = top_neighbors[top_neighbors > 0]
         if top_neighbors.empty:
             return pd.DataFrame(columns=["predicted_rating", "confidence"])
 
+        # Mean-centered weighted average of neighbor ratings
         neighbor_ratings = ratings_matrix.loc[top_neighbors.index]
         neighbor_means = user_means.loc[top_neighbors.index]
         diff = neighbor_ratings.sub(neighbor_means, axis=0)
@@ -313,15 +366,21 @@ class CollaborativeFiltering:
         contributed = diff.notna()
         denominator = contributed.mul(top_neighbors.abs(), axis=0).sum(axis=0)
         support_count = contributed.sum(axis=0)
+
         with np.errstate(invalid="ignore", divide="ignore"):
             predicted = target_mean + (numerator / denominator)
         predicted = predicted.where(
             (denominator > 0) & (support_count >= self.MIN_PREDICTION_SUPPORT)
         )
+        # Only keep predictions backed by enough neighbor support
         predicted = predicted.clip(self.RATING_MIN, self.RATING_MAX)
+
+        # Confidence = average similarity weight behind the prediction
         confidence = (denominator / support_count.replace(0, np.nan)).fillna(0.0)
         result = pd.DataFrame({"predicted_rating": predicted, "confidence": confidence})
         result.index.name = "movieId"
+
+        # Exclude movies the user has already rated
         already_rated = ratings_matrix.loc[user_id].dropna().index
         return result.drop(index=already_rated, errors="ignore").dropna(subset=["predicted_rating"])
 
@@ -332,6 +391,8 @@ class CollaborativeFiltering:
         method: str = DEFAULT_ITEM_METHOD,
         item_means: pd.Series | None = None,
     ) -> pd.DataFrame:
+        '''Predict ratings for all unseen movies using the k most similar
+        movies (to each candidate) that the user has already rated.'''
         ratings_matrix, _, _ = self._require_fit()
         if user_id not in ratings_matrix.index:
             return pd.DataFrame(columns=["predicted_rating", "confidence"])
@@ -351,6 +412,7 @@ class CollaborativeFiltering:
         k_neighbors: int,
         item_means: pd.Series,
     ) -> pd.DataFrame:
+        # Vectorized item-based prediction
         if user_id not in ratings_matrix.index:
             return pd.DataFrame(columns=["predicted_rating", "confidence"])
 
@@ -360,9 +422,15 @@ class CollaborativeFiltering:
             return pd.DataFrame(columns=["predicted_rating", "confidence"])
 
         candidate_ids = item_similarity.index
+
+        # similarity between every candidate movie and every movie the user rated
         sim_matrix = item_similarity.loc[candidate_ids, rated_movie_ids].to_numpy()
         rated_means = item_means.loc[rated_movie_ids].to_numpy()
+
+        # how much the user's rating deviated from each rated movie's own average
         deviations = user_row.loc[rated_movie_ids].to_numpy() - rated_means
+
+        # For each candidate movie, keep only its top-k most similar rated movies
         k = min(max(int(k_neighbors), 1), sim_matrix.shape[1])
         abs_sim = np.abs(sim_matrix)
         top_k_idx = np.argpartition(-abs_sim, kth=k - 1, axis=1)[:, :k]
@@ -371,18 +439,22 @@ class CollaborativeFiltering:
         mask[row_idx, top_k_idx] = True
         mask &= abs_sim > 0
         masked_sim = np.where(mask, sim_matrix, 0.0)
+
         numerator = masked_sim @ deviations
         denominator = np.abs(masked_sim).sum(axis=1)
         support_count = mask.sum(axis=1)
         candidate_means = item_means.reindex(candidate_ids).fillna(item_means.mean()).to_numpy()
+
         with np.errstate(invalid="ignore", divide="ignore"):
             predicted = candidate_means + numerator / denominator
+        # Only keep predictions backed by enough neighbor support
         predicted = np.where(
             (denominator > 0) & (support_count >= self.MIN_PREDICTION_SUPPORT),
             predicted,
             np.nan,
         )
         predicted = np.clip(predicted, self.RATING_MIN, self.RATING_MAX)
+        # Confidence = average absolute similarity weight used
         confidence = np.divide(
             denominator,
             np.where(support_count > 0, support_count, np.nan),
@@ -394,6 +466,7 @@ class CollaborativeFiltering:
             index=candidate_ids,
         )
         result.index.name = "movieId"
+        # Exclude movies the user has already rated
         return result.drop(index=rated_movie_ids, errors="ignore").dropna(subset=["predicted_rating"])
 
     def predict_svd(self, user_id: int, n_components: int = DEFAULT_N_COMPONENTS) -> pd.DataFrame:
@@ -406,6 +479,8 @@ class CollaborativeFiltering:
             ratings_matrix.loc[user_id].dropna().index if user_id in ratings_matrix.index else []
         )
         predicted = predicted.drop(index=already_rated, errors="ignore")
+
+        # Normalize confidence by the spread of this user's predicted ratings
         spread = float(predicted.max() - predicted.min()) if not predicted.empty else 0.0
         if spread > 0:
             confidence = (predicted - predicted.min()) / spread
@@ -425,6 +500,9 @@ class CollaborativeFiltering:
             )
             global_mean = float(self.ratings_df["rating"].mean())
             prior = self.POPULARITY_PRIOR_VOTES
+            '''Bayesian average: blends each movie's own average with the
+            global average, weighted by how many votes it has. Movies
+            with few votes get pulled toward the global mean'''
             stats["predicted_rating"] = (
                 stats["vote_count"] / (stats["vote_count"] + prior) * stats["avg_rating"]
                 + prior / (stats["vote_count"] + prior) * global_mean
@@ -485,6 +563,7 @@ class CollaborativeFiltering:
         item_method: str,
         n_components: int,
     ) -> pd.DataFrame:
+        """Dispatch to the right prediction method based on the chosen variant."""
         variant = _normalize_variant(variant)
         if variant == VARIANT_USER:
             return self.predict_user_based(user_id, neighborhood_k)
@@ -524,6 +603,7 @@ class CollaborativeFiltering:
             n_components = int(_LAST_CONTROLS.get("n_components") or self.n_factors)
         components = int(n_components)
 
+        # Cold-start check
         n_user_ratings = len(self.user_train_ratings.get(user_id, {}))
         is_cold_start = n_user_ratings < self.COLD_START_MIN_RATINGS
         rationale_label = (
@@ -539,6 +619,7 @@ class CollaborativeFiltering:
             scores = scores.drop(index=self.user_train_movies.get(user_id, set()), errors="ignore")
             rationale_label = "Popularity fallback (cold start)"
         else:
+            # Normal path: try the chosen CF variant
             try:
                 scores = self._scores_for_model(user_id, variant, k, item_method, components)
             except Exception:
@@ -546,6 +627,7 @@ class CollaborativeFiltering:
             if min_rating > 0 and not scores.empty:
                 scores = scores[scores["predicted_rating"] >= min_rating]
             if scores.empty:
+                # Graceful fallback
                 scores = self.get_popular_movies().copy()
                 scores = scores.drop(index=self.user_train_movies.get(user_id, set()), errors="ignore")
                 is_cold_start = True
@@ -557,6 +639,7 @@ class CollaborativeFiltering:
                 raise ValueError("No unseen movies match that genre filter.")
             raise ValueError(f"No ratings found for user {user_id}.")
 
+        # Remember the details of this call so recommendation_reasons() can explain it
         self._last_scores = scores
         self.last_is_cold_start = is_cold_start
         self.last_rationale_label = rationale_label
@@ -634,6 +717,7 @@ class CollaborativeFiltering:
             if not reasons:
                 reasons.append("User-based CF: similar users to you")
         elif variant == VARIANT_ITEM:
+            # Explain via the single most similar movie the user already rated
             rated = self.user_train_ratings.get(user_id, {})
             item_sim = self.item_similarity(method=item_method)
             best: tuple[float, int, float] | None = None
@@ -651,6 +735,7 @@ class CollaborativeFiltering:
             method_label = "Pearson" if item_method == ITEM_METHOD_PEARSON else "cosine"
             reasons.append(f"Item-based CF ({method_label}): close to movies you already rated")
         else:
+            # SVD: no per-neighbor explanation available
             reasons.append("SVD: matches your rating pattern")
             if self.ratings_matrix is not None and movie_id in self.ratings_matrix.columns:
                 n_raters = int(self.ratings_matrix[movie_id].notna().sum())
@@ -673,6 +758,8 @@ class CollaborativeFiltering:
     def score_test_ratings(
         self, test_ratings: pd.DataFrame
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Look up SVD-predicted ratings for every (user, movie) pair in a
+        held-out test set, for RMSE/precision/recall evaluation"""
         if test_ratings.empty:
             return np.array([]), np.array([])
         pred_matrix = self.svd_predictions(n_components=self.n_factors)
@@ -697,6 +784,8 @@ class CollaborativeFiltering:
         relevance_threshold: float,
         decision_threshold: float,
     ) -> dict[str, float]:
+        """Turn continuous ratings into "liked"/"not liked" labels using
+        the given thresholds, then compute standard classification metrics."""
         actual_liked = (actual >= relevance_threshold).astype(int)
         predicted_liked = (predicted >= decision_threshold).astype(int)
         return {
@@ -714,6 +803,9 @@ class CollaborativeFiltering:
         relevance_threshold: float = 4.0,
         decision_threshold: float | None = None,
     ) -> dict[str, float]:
+        """Compute RMSE/MSE plus classification metrics. If no fixed
+        decision_threshold is given, grid-search thresholds between 2.5 and
+        4.2 and keep whichever gives the best F1-score."""
         if actual.size == 0:
             return {
                 "rmse": float("nan"),
@@ -771,6 +863,7 @@ class CollaborativeFiltering:
         }
 
     def split_train_test(self, test_size: float = 0.2, random_state: int = 42):
+        """80/20 (by default) random split of the ratings for evaluation"""
         if self.ratings_df is None:
             raise RuntimeError("Collaborative model is not fitted.")
         return train_test_split(self.ratings_df, test_size=test_size, random_state=random_state)
@@ -802,6 +895,7 @@ def render_controls(movies: pd.DataFrame | None = None) -> tuple[str, list[str],
     neighborhood_k = DEFAULT_NEIGHBORHOOD_K
     item_method = DEFAULT_ITEM_METHOD
     n_components = DEFAULT_N_COMPONENTS
+    # Only show the neighborhood-size slider for the two kNN-style variants
     if variant in {VARIANT_USER, VARIANT_ITEM}:
         neighborhood_k = int(
             st.slider(
@@ -814,6 +908,7 @@ def render_controls(movies: pd.DataFrame | None = None) -> tuple[str, list[str],
                 help="How many similar users (user-based) or similar movies (item-based) to use.",
             )
         )
+    # Only show the similarity-metric choice for item-based CF
     if variant == VARIANT_ITEM:
         item_label = st.radio(
             "Item similarity",
@@ -823,6 +918,7 @@ def render_controls(movies: pd.DataFrame | None = None) -> tuple[str, list[str],
             help="Pearson (adjusted cosine) centers each movie by its mean rating first.",
         )
         item_method = ITEM_METHOD_OPTIONS[item_label]
+    # Only show the latent-factor slider for SVD
     if variant == VARIANT_SVD:
         n_components = int(
             st.slider(
@@ -839,21 +935,22 @@ def render_controls(movies: pd.DataFrame | None = None) -> tuple[str, list[str],
     _LAST_CONTROLS["n_components"] = n_components
     return variant, list(genres), neighborhood_k, item_method, n_components
 
-
+# Load the cleaned ratings and movies CSVs produced by preprocessing
 def load_data(processed_dir: Path | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     processed_dir = processed_dir or _find_processed_dir()
     ratings = pd.read_csv(processed_dir / "ratings_clean.csv")
     movies = pd.read_csv(processed_dir / "movies_clean.csv")
     return ratings, movies
 
-
+# Quick manual smoke-test
 def demo(user_id: int = 1, top_n: int = 10, n_factors: int = DEFAULT_N_COMPONENTS) -> pd.DataFrame:
     ratings, movies = load_data()
     model = CollaborativeFiltering(n_factors=n_factors).fit(ratings, movies=movies)
     return model.recommend(user_id, n_recommendations=top_n, variant=VARIANT_USER)
 
-
 def parse_args() -> argparse.Namespace:
+    """CLI arguments for running this module directly, e.g.:
+    `py collaborative_filtering.py --user-id 5 --model "Item-Based CF"`"""
     parser = argparse.ArgumentParser(description="Run collaborative filtering.")
     parser.add_argument("--user-id", type=int, default=1, help="User id to recommend for.")
     parser.add_argument("--top-n", type=int, default=10, help="Number of recommendations.")
@@ -871,7 +968,7 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
+# Load data, fit the model, print recommendations
 if __name__ == "__main__":
     args = parse_args()
     ratings, movies = load_data()
