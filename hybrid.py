@@ -30,13 +30,17 @@ DEFAULT_ALPHA_GRID = [0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80] #alp
 CLASSIFICATION_THRESHOLDS = np.round(np.arange(2.5, 4.25, 0.05), 2) #try many cutoffs to find the best F1
 ITEM_SUPPORT_SHRINK = 25.0 #how fast the blend moves from content to SVD when a movie has more ratings
 MIN_CONTENT_MIX = 0.25 #content always keeps at least this share of the mix
-CONTENT_NEIGHBOR_K = 40 #prediction can use 40 similar previous rated movie
-CONTENT_SHRINKAGE = 12.0 #pull the content prediction toward the user average when there is little data
 
 
 #Rating range validation
 def _clip_rating(value: float) -> float:
     return float(np.clip(value, MIN_RATING, MAX_RATING)) #np.clip() = forces the value to stay between min_rating and max_rating
+
+
+#Turn cosine similarity (0–1) into a 0.5–5 score so it can be blended with SVD
+def _score_from_cosine(similarity: float) -> float:
+    similarity = float(np.clip(similarity, 0.0, 1.0))
+    return _clip_rating(MIN_RATING + (MAX_RATING - MIN_RATING) * similarity)
 
 
 #Finding folder that containig processed data
@@ -125,6 +129,24 @@ def blend_source_label(content_weight: float) -> str:
     if content_weight <= 0.25:
         return "Collaborative-leaning"
     return "Balanced"
+
+
+def _content_match_phrase(score: float) -> str:
+    if score < 2.0:
+        return "weak genres/tags match to movies you've seen"
+    if score < 3.5:
+        return "moderate genres/tags match to movies you've seen"
+    return "strong genres/tags match to movies you've seen"
+
+
+def _svd_match_phrase(score: float) -> str:
+    if score >= 4.85:
+        return "similar raters put this at the 5★ cap"
+    if score >= 4.0:
+        return "similar raters are predicted to like this"
+    if score >= 3.0:
+        return "similar raters are predicted to feel mixed"
+    return "similar raters are not predicted to like this"
 
 
 #Find which column names the table is using
@@ -273,8 +295,8 @@ def plot_blend_weights(
 
 
 #ContentBasedRecommender class
-#TF-IDF = Uses movie genres and tags to represent movie content numerically.
-#Cosine similarity = Measures how similar two movies are based on their content.
+#Genre + tags -> TF-IDF -> cosine similarity.
+#Star ratings are only used as "movies this user has seen", not as profile weights.
 #This class is only used by HybridRecommender so both models can be blended later.
 class ContentBasedRecommender:
     #Content based recommender model training and prediction
@@ -286,18 +308,16 @@ class ContentBasedRecommender:
         self.user_ratings: dict[int, dict[int, float]] = {}
         self.user_profiles: dict[int, np.ndarray] = {}
         #Stores the TF-IDF profile representing each user's movie taste
-        self.user_rated_indices: dict[int, np.ndarray] = {}
-        self.user_rated_values: dict[int, np.ndarray] = {}
-        self.user_means: dict[int, float] = {} #store movie position and ratings
-        self.global_mean: float = 3.5 #stores each user's average rating
-        self.neighbor_k = CONTENT_NEIGHBOR_K
-        self.shrinkage = CONTENT_SHRINKAGE
         self.vectorizer = TfidfVectorizer(**CONTENT_VECTORIZER_PARAMS) #Creates the TF-IDF vectorizer
 
     #Train/Build the Model
     def fit(
-        self, ratings: pd.DataFrame, movie_content: pd.DataFrame
+        self,
+        ratings: pd.DataFrame,
+        movie_content: pd.DataFrame,
+        movies: pd.DataFrame | None = None,
     ) -> "ContentBasedRecommender":
+        del movies  # hybrid may pass movies; content scoring does not use them
         content = movie_content.copy()
         #make sure the content feature column has no missing value and contains string
         content["content_features"] = content["content_features"].fillna("").astype(str)
@@ -310,9 +330,7 @@ class ContentBasedRecommender:
         self.movie_id_to_index = {
             int(movie_id): index for index, movie_id in enumerate(self.movie_ids)
         }
-        #Calculate global average rating
-        self.global_mean = float(ratings["rating"].mean())
-        #Store user ratings
+        #Keep which movies each user has seen (ignore the star value when scoring)
         self.user_ratings = {
             int(user_id): {
                 int(row.movieId): float(row.rating) for row in user_frame.itertuples()
@@ -327,43 +345,32 @@ class ContentBasedRecommender:
         if self.tfidf_matrix is None:
             return
         self.user_profiles = {}
-        self.user_rated_indices = {}
-        self.user_rated_values = {}
-        self.user_means = {}
         for user_id, rated_movies in self.user_ratings.items(): #Processes one user at a time
-            indices, values = [], []
-            #Find their rated movies
-            for movie_id, rating in rated_movies.items():
+            indices = []
+            #Find movies this user has seen (do not use the star as a weight)
+            for movie_id in rated_movies:
                 index = self.movie_id_to_index.get(movie_id)
                 if index is not None:
-                    #Store indexes and ratings
                     indices.append(index)
-                    values.append(rating)
             if not indices:
                 continue
             index_array = np.asarray(indices, dtype=int)
-            value_array = np.asarray(values, dtype=float)
-            #Create the user's profile = rating-weighted average of TF-IDF movie vectors
-            profile = np.average(self.tfidf_matrix[index_array], axis=0, weights=value_array)
-            #Normalize the user profile
+            #Unweighted mean of those movies' TF-IDF vectors
+            profile = self.tfidf_matrix[index_array].mean(axis=0)
             self.user_profiles[user_id] = normalize(profile.reshape(1, -1), norm="l2").ravel()
-            #Store information for prediction
-            self.user_rated_indices[user_id] = index_array
-            self.user_rated_values[user_id] = value_array
-            self.user_means[user_id] = float(value_array.mean())
 
     #Get User Profile
     def _user_profile(self, user_id: int) -> np.ndarray | None:
         return self.user_profiles.get(user_id)
 
     #Calculate Movie Similarity
-    def _cosine_to_profile(self, user_id: int, movie_id: int) -> float | None: #How similar is this movie to the user's overall movie taste?
+    def _cosine_to_profile(self, user_id: int, movie_id: int) -> float: #How similar is this movie to the user's overall movie taste?
         if self.tfidf_matrix is None:
-            return None
+            return 0.0
         profile = self._user_profile(user_id) #get user profile
         movie_index = self.movie_id_to_index.get(movie_id) #Finds the movie's TF-IDF vector
         if profile is None or movie_index is None:
-            return None
+            return 0.0
         #Calculate cosine similarity
         similarity = float(
             cosine_similarity(
@@ -373,89 +380,33 @@ class ContentBasedRecommender:
         )
         return float(np.clip(similarity, 0.0, 1.0))
 
-    #Predict User Rating
-    def predict(self, user_id: int, movie_id: int) -> float: #predict What rating is this user likely to give this movie?
+    #Predict a 0.5–5 content score from cosine similarity (not from star ratings)
+    def predict(self, user_id: int, movie_id: int) -> float:
         if self.tfidf_matrix is None:
             raise RuntimeError("Content model is not fitted.")
+        return _score_from_cosine(self._cosine_to_profile(user_id, movie_id))
 
-        #Find the movie and user's rated movies
-        movie_index = self.movie_id_to_index.get(movie_id)
-        rated_indices = self.user_rated_indices.get(user_id)
-        rated_values = self.user_rated_values.get(user_id)
-        user_mean = self.user_means.get(user_id, self.global_mean)
-        if movie_index is None or rated_indices is None or rated_values is None:
-            return user_mean
-        return self._predict_from_neighbors(
-            rated_indices, rated_values, movie_index, user_mean
-        )
-
-    #Calculate similarity with previously rated movies
-    def _predict_from_neighbors(
-        self,
-        rated_indices: np.ndarray,
-        rated_values: np.ndarray,
-        movie_index: int,
-        user_mean: float,
-    ) -> float:
-        if self.tfidf_matrix is None:
-            return user_mean
-        similarities = np.clip(
-            self.tfidf_matrix[rated_indices] @ self.tfidf_matrix[movie_index],
-            0.0,
-            None,
-        )
-        return self._aggregate_neighbors(similarities, rated_values, user_mean)
-
-    #Select top K similar movies and calculate the predicted rating
-    def _aggregate_neighbors(
-        self,
-        similarities: np.ndarray,
-        rated_values: np.ndarray,
-        user_mean: float,
-    ) -> float:
-        k = min(self.neighbor_k, similarities.size)
-        if k <= 0:
-            return user_mean
-        if similarities.size > k:
-            top = np.argpartition(similarities, -k)[-k:] #keep the k most similar movies
-            similarities = similarities[top]
-            rated_values = rated_values[top]
-        mass = float(similarities.sum())
-        if mass <= 1e-9:
-            return user_mean
-        #Calculate weighted rating = Movies that are more similar have greater influence
-        neighbor = float(np.dot(similarities, rated_values) / mass)
-        #Apply shrinkage = more data = less shrinkage, less data = more shrinkage
-        predicted = (mass * neighbor + self.shrinkage * user_mean) / (
-            mass + self.shrinkage
-        )
-        #Keep rating within the valid range
-        return _clip_rating(predicted)
-
-    #Predict many ratings at once for evaluation
+    #Predict many content scores at once for evaluation
     def predict_many(self, user_ids: np.ndarray, movie_ids: np.ndarray) -> np.ndarray:
         if self.tfidf_matrix is None:
             raise RuntimeError("Content model is not fitted.")
 
-        #Start with the global average, then overwrite when we can do better
-        predictions = np.full(len(user_ids), self.global_mean, dtype=float)
-        if len(user_ids) == 0:
+        n_rows = len(user_ids)
+        predictions = np.full(n_rows, MIN_RATING, dtype=float) #cosine 0 maps to 0.5
+        if n_rows == 0:
             return predictions
 
         grouped = pd.DataFrame(
             {
-                "row": np.arange(len(user_ids)),
+                "row": np.arange(n_rows),
                 "userId": np.asarray(user_ids, dtype=int),
                 "movieId": np.asarray(movie_ids, dtype=int),
             }
         )
         for user_id, group in grouped.groupby("userId"): #one user at a time
-            rated_indices = self.user_rated_indices.get(int(user_id))
-            rated_values = self.user_rated_values.get(int(user_id))
-            user_mean = self.user_means.get(int(user_id), self.global_mean)
+            profile = self._user_profile(int(user_id))
             row_indices = group["row"].to_numpy()
-            predictions[row_indices] = user_mean
-            if rated_indices is None or rated_values is None:
+            if profile is None:
                 continue
 
             movie_indices = np.array(
@@ -467,17 +418,11 @@ class ContentBasedRecommender:
                 continue
 
             similarities = np.clip(
-                self.tfidf_matrix[rated_indices] @ self.tfidf_matrix[movie_indices[known]].T,
+                self.tfidf_matrix[movie_indices[known]] @ profile,
                 0.0,
-                None,
+                1.0,
             )
-            known_rows = row_indices[known]
-            for local_index, row_index in enumerate(known_rows):
-                predictions[row_index] = self._aggregate_neighbors(
-                    similarities[:, local_index],
-                    rated_values,
-                    user_mean,
-                )
+            predictions[row_indices[known]] = MIN_RATING + (MAX_RATING - MIN_RATING) * similarities
         return predictions
 
     #Generate Top Recommendations
@@ -746,7 +691,7 @@ def split_train_test(
 
 #HybridRecommender class
 #This model combines two methods:
-#1. Content-based = TF-IDF + cosine similarity
+#1. Content-based = genres/tags -> TF-IDF -> cosine similarity
 #2. Collaborative = SVD matrix factorization
 #Then it blends both scores. Rare movies use more content, popular movies use more SVD.
 class HybridRecommender:
@@ -894,39 +839,69 @@ class HybridRecommender:
         return scored.sort_values("score_gap", ascending=False).head(n_movies).reset_index(drop=True)
 
     #Explain Why a Movie Was Recommended
-    def recommendation_reasons(self, row: pd.Series, user_id: int | None = None) -> list[str]: #return a list of reason
+    def recommendation_reasons(self, row: pd.Series, user_id: int | None = None) -> list[str]:
         count = int(row.get("rating_count", 0) or 0)
-        content_weight = float(row.get("content_weight", 0.5) or 0.5)
+        if "content_weight" in row.index and pd.notna(row["content_weight"]):
+            content_weight = float(row["content_weight"])
+        else:
+            content_weight = 0.5
+        cf_weight = 1.0 - content_weight
         content_score = float(row.get("content_rating", row.get("Content score", 0.0)) or 0.0)
         cf_score = float(row.get("cf_rating", row.get("Collaborative score", 0.0)) or 0.0)
-        source = str(row.get("blend_source", blend_source_label(content_weight)))
+        hybrid_score = float(row.get("hybrid_rating", row.get("Hybrid score", 0.0)) or 0.0)
         reasons: list[str] = []
-        if user_id is not None:
-            if getattr(self.content_model, "movies", None) is None:
-                self.content_model.movies = self.movies
-            if hasattr(self.content_model, "recommendation_reasons"):
-                reasons.extend(
-                    self.content_model.recommendation_reasons(
-                        int(user_id), int(row["movieId"])
-                    )[:4]
-                )
-        reasons.append(f"{source}: {content_weight:.0%} content / {1.0 - content_weight:.0%} SVD")
-        if count <= 15:
-            reasons.append(f"Rarely rated ({count} ratings), so content has more influence")
+
+        #Show the actual mix so Hybrid = SVD is obvious when content weight is ~0
+        reasons.append(
+            f"Hybrid {hybrid_score:.2f} = {content_weight:.0%} × content {content_score:.2f} "
+            f"+ {cf_weight:.0%} × SVD {cf_score:.2f}"
+        )
+        reasons.append(f"Content {content_score:.2f}: {_content_match_phrase(content_score)}")
+        reasons.append(f"SVD {cf_score:.2f}: {_svd_match_phrase(cf_score)}")
+
+        if self.alpha <= 0.05:
+            reasons.append(
+                f"Alpha is {self.alpha:.2f}, so SVD decides the mix even with only {count} ratings"
+            )
+        elif content_weight >= 0.45:
+            reasons.append(
+                f"Only {count} ratings, so content gets more of the mix ({content_weight:.0%})"
+            )
         elif count >= 120:
-            reasons.append(f"Popular movie ({count} ratings), so SVD has more influence")
+            reasons.append(
+                f"{count} ratings, so SVD is trusted more ({cf_weight:.0%})"
+            )
         else:
-            reasons.append(f"{count} ratings in the training data")
-        gap = content_score - cf_score
-        if gap >= 0.35:
             reasons.append(
-                f"Content likes it more ({content_score:.2f} vs SVD {cf_score:.2f})"
+                f"{count} ratings → {content_weight:.0%} content, {cf_weight:.0%} SVD "
+                f"(alpha {self.alpha:.2f})"
             )
-        elif gap <= -0.35:
-            reasons.append(
-                f"People like you like it more (SVD {cf_score:.2f} vs content {content_score:.2f})"
-            )
+
+        overlap = self._shared_genre_reason(user_id, row.get("movieId"))
+        if overlap:
+            reasons.append(overlap)
         return reasons
+
+    def _shared_genre_reason(self, user_id: int | None, movie_id: object) -> str | None:
+        if user_id is None or movie_id is None or self.movies is None:
+            return None
+        from content_based import split_movie_genres
+
+        rec_row = self.movies.loc[self.movies["movieId"] == int(movie_id)]
+        if rec_row.empty:
+            return None
+        rec_genres = split_movie_genres(rec_row.iloc[0].get("genres", ""))
+        history = getattr(self.content_model, "user_ratings", {}).get(int(user_id), {})
+        seen_genres: set[str] = set()
+        for seen_id in history:
+            seen_row = self.movies.loc[self.movies["movieId"] == int(seen_id)]
+            if seen_row.empty:
+                continue
+            seen_genres.update(split_movie_genres(seen_row.iloc[0].get("genres", "")))
+        shared = [genre for genre in rec_genres if genre in seen_genres][:3]
+        if not shared:
+            return None
+        return "Shares " + ", ".join(shared) + " with movies you've already seen"
 
     #Search movies by title and/or genre
     def search_movies(
