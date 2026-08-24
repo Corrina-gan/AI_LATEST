@@ -1,5 +1,6 @@
 """Streamlit movie recommendation app (MovieLens assignment UI)."""
 
+#Imports
 from __future__ import annotations
 
 import ast
@@ -17,8 +18,8 @@ import content_based
 import data_visualization
 import hybrid
 
-# Streamlit can keep a stale collaborative_filtering module from an earlier
-# script run. Reload it when this app expects APIs that are missing.
+#Streamlit can keep a stale collaborative_filtering module from an earlier
+#script run. Reload it when this app expects APIs that are missing.
 if not hasattr(collaborative_filtering, "render_controls"):
     collaborative_filtering = reload(collaborative_filtering)
 if not hasattr(collaborative_filtering, "DEFAULT_ITEM_METHOD"):
@@ -31,6 +32,7 @@ if not hasattr(collaborative_filtering, "ITEM_METHOD_OPTIONS"):
         "Pearson (adjusted cosine)": "pearson",
     }
 
+#Page setup: wide layout so recommendation cards and charts have room
 st.set_page_config(
     page_title="Movie Recommendation System",
     page_icon="🎬",
@@ -38,14 +40,16 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+#Constant
 HybridRecommender = hybrid.HybridRecommender
 BASE_DIR = Path(__file__).resolve().parent
-PROCESSED_FILES = (
+PROCESSED_FILES = ( #cleaned CSVs the app needs before it can train models
     "ratings_clean.csv",
     "movies_clean.csv",
     "movies_content.csv",
 )
 
+#Top navigation pills on the home page
 MAIN_TABS = (
     "🔀 Hybrid",
     "🎬 Content-based",
@@ -69,6 +73,7 @@ DISPLAY_METRIC_KEYS = (
     "decision_threshold",
 )
 
+#Names and colors used on the Model Comparison page
 COMPARISON_ALGORITHMS = (
     "Content-based (TF-IDF)",
     "Collaborative (SVD)",
@@ -82,6 +87,7 @@ MODEL_COLORS = {
 }
 
 
+#Look for a cleaned CSV in processed/ or dataset/processed/
 def _find_processed_file(filename: str) -> Path:
     for candidate in (
         BASE_DIR / "processed" / filename,
@@ -94,6 +100,7 @@ def _find_processed_file(filename: str) -> Path:
     )
 
 
+#Build a cache key from file timestamps so models retrain after preprocessing
 def processed_data_signature() -> str:
     """Cache key that changes when cleaned CSV files are rebuilt."""
     parts: list[str] = []
@@ -108,11 +115,13 @@ def processed_data_signature() -> str:
     return "|".join(parts)
 
 
+#Keep only the numbers shown in metric cards (drop large prediction arrays)
 def _scalar_metrics(result: dict) -> dict[str, float]:
     """Keep RMSE / classification numbers; drop arrays from evaluate()."""
     return {key: float(result[key]) for key in DISPLAY_METRIC_KEYS if key in result}
 
 
+#Attach predicted vs actual arrays so evaluation charts can be drawn later
 def _pack_eval_arrays(
     metrics: dict,
     actual: np.ndarray,
@@ -135,6 +144,7 @@ def _pack_eval_arrays(
     return packed
 
 
+#Load cleaned movies, ratings, links, and posters (cached until CSVs change)
 @st.cache_data(show_spinner=False)
 def load_dataset(data_sig: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     del data_sig  # used only as a Streamlit cache key
@@ -156,6 +166,7 @@ def load_dataset(data_sig: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFram
     return ratings, movies, movie_content, links, posters
 
 
+#Load tags separately; the visualization tab needs them, recommenders do not
 @st.cache_data(show_spinner=False)
 def load_tags(data_sig: str) -> pd.DataFrame:
     del data_sig
@@ -165,6 +176,7 @@ def load_tags(data_sig: str) -> pd.DataFrame:
     return tags
 
 
+#Train all three models once, then reuse them across page reruns
 @st.cache_resource(show_spinner=False)
 def train_models(
     data_sig: str,
@@ -173,8 +185,7 @@ def train_models(
     random_state: int = 42,
 ):
     ratings, movies, movie_content, links, posters = load_dataset(data_sig)
-    # Shared 80/20 split so the three standalone evaluations are comparable.
-    # cf-v2: assignment CF engine (user kNN, item kNN, TruncatedSVD).
+    #Shared 80/20 split so the three standalone evaluations are comparable.
     train_ratings, test_ratings = content_based.split_train_test(
         ratings, test_size=test_size, random_state=random_state
     )
@@ -182,9 +193,11 @@ def train_models(
     content_model = content_based.ContentBasedRecommender().fit(
         train_ratings, movie_content, movies=movies
     )
+    #Assignment CF engine: user kNN, item kNN, or TruncatedSVD
     collaborative_model = collaborative_filtering.CollaborativeFiltering(
         n_factors=n_factors
     ).fit(train_ratings, movies=movies)
+    #Pick the hybrid alpha that gets the best F1 on the test split
     best_alpha, tuning_results, hybrid_model, hybrid_metrics = hybrid.tune_alpha(
         train_ratings,
         test_ratings,
@@ -198,6 +211,7 @@ def train_models(
     content_eval = content_model.evaluate(test_ratings, relevance_threshold=4.0)
     collaborative_eval = collaborative_model.evaluate(test_ratings, relevance_threshold=4.0)
 
+    #Score the hybrid on the same test pairs used by the other two models
     test_user_ids = test_ratings["userId"].astype(int).to_numpy()
     test_movie_ids = test_ratings["movieId"].astype(int).to_numpy()
     hybrid_actual = test_ratings["rating"].to_numpy(dtype=float)
@@ -237,6 +251,7 @@ def train_models(
     )
 
 
+#Build IMDb / TMDb links from numeric IDs in links_clean.csv
 def _imdb_url(imdb_id: object) -> str | None:
     if pd.isna(imdb_id):
         return None
@@ -249,6 +264,7 @@ def _tmdb_url(tmdb_id: object) -> str | None:
     return f"https://www.themoviedb.org/movie/{int(tmdb_id)}"
 
 
+#Add poster URLs, IMDb/TMDB links, and average rating to a recommendation table
 def attach_meta(
     frame: pd.DataFrame,
     links: pd.DataFrame,
@@ -264,6 +280,7 @@ def attach_meta(
     return enriched
 
 
+#Average rating and rating count per movie (shown on cards)
 def movie_rating_stats(ratings: pd.DataFrame) -> pd.DataFrame:
     return ratings.groupby("movieId", as_index=False).agg(
         avg_rating=("rating", "mean"),
@@ -271,6 +288,7 @@ def movie_rating_stats(ratings: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+#Quick stats for the selected user: how many movies, likes, dislikes
 def user_summary(ratings: pd.DataFrame, user_id: int) -> dict[str, float]:
     user = ratings.loc[ratings["userId"] == user_id]
     return {
@@ -281,6 +299,7 @@ def user_summary(ratings: pd.DataFrame, user_id: int) -> dict[str, float]:
     }
 
 
+#This user's past ratings, highest first (shown in the expander)
 def user_history(
     ratings: pd.DataFrame, movies: pd.DataFrame, user_id: int
 ) -> pd.DataFrame:
@@ -290,6 +309,7 @@ def user_history(
     return history[["movieId", "title", "genres", "rating"]].reset_index(drop=True)
 
 
+#Call the chosen recommender and rename score columns for the UI
 def get_recommendations(
     algorithm: str,
     user_id: int,
@@ -310,6 +330,7 @@ def get_recommendations(
     cf_n_components: int = collaborative_filtering.DEFAULT_N_COMPONENTS,
 ) -> tuple[pd.DataFrame, list[str]]:
     if algorithm == content_based.ALGORITHM_KEY:
+        #Content-based: TF-IDF + cosine similarity to the user's profile
         if content_model is None:
             raise RuntimeError("Content-based model is not trained.")
         recs = content_model.recommend(
@@ -323,6 +344,7 @@ def get_recommendations(
         return display, ["Score"]
 
     if algorithm == collaborative_filtering.ALGORITHM_KEY:
+        #Collaborative: user kNN, item kNN, or TruncatedSVD
         if collaborative_model is None:
             raise RuntimeError("Collaborative model is not trained.")
         recs = collaborative_model.recommend(
@@ -338,6 +360,7 @@ def get_recommendations(
         display = recs.rename(columns={"predicted_rating": "Score"})
         return display, ["Score"]
 
+    #Hybrid: temporarily apply the sidebar alpha, then restore the tuned value
     if hybrid_model is None:
         raise RuntimeError("Hybrid model is not trained.")
     previous_alpha = hybrid_model.alpha
@@ -357,6 +380,7 @@ def get_recommendations(
         hybrid_model.alpha = previous_alpha
 
 
+#Turn "Action|Comedy" (or a Python list string) into a list of genre names
 def _genre_labels(value: object) -> list[str]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return []
@@ -374,6 +398,7 @@ def _genre_labels(value: object) -> list[str]:
     ]
 
 
+#Pick a CSS class so content / SVD / hybrid scores get different colors
 def _score_pill_class(column: str) -> str:
     name = str(column).lower()
     if "content" in name:
@@ -385,6 +410,7 @@ def _score_pill_class(column: str) -> str:
     return "score"
 
 
+#HTML for the colored stat tiles (RMSE, F1, movies rated, etc.)
 def _stat_tiles_html(tiles: list[tuple[str, str, str]]) -> str:
     cards = []
     for label, value, tone in tiles:
@@ -401,6 +427,7 @@ def _stat_tiles_html(tiles: list[tuple[str, str, str]]) -> str:
     )
 
 
+#One movie card: poster, title, genre chips, scores, IMDb/TMDB links
 def _movie_card_html(row: pd.Series, score_columns: list[str]) -> str:
     title = escape(str(row.get("title") or "Unknown title"))
     poster_url = row.get("poster_url")
@@ -467,6 +494,7 @@ def _movie_card_html(row: pd.Series, score_columns: list[str]) -> str:
     )
 
 
+#Show recommendation results as a grid of movie cards
 def render_recommendation_cards(frame: pd.DataFrame, score_columns: list[str]) -> None:
     if frame.empty:
         st.info("No recommendations available.")
@@ -477,6 +505,7 @@ def render_recommendation_cards(frame: pd.DataFrame, score_columns: list[str]) -
     st.html(f'<div class="movie-grid">{cards}</div>')
 
 
+#RMSE + liked/not-liked metric tiles used on evaluation pages
 def _metric_cards(metrics: dict[str, float]) -> None:
     st.html(
         _stat_tiles_html(
@@ -496,6 +525,7 @@ def _metric_cards(metrics: dict[str, float]) -> None:
     )
 
 
+#Evaluation charts: classification bars, scatter, residuals, confusion matrix
 def _evaluation_classification_chart(metrics: dict) -> plt.Figure:
     labels = ["Precision", "Recall", "F1-score", "Accuracy"]
     values = [
@@ -513,6 +543,7 @@ def _evaluation_classification_chart(metrics: dict) -> plt.Figure:
     return fig
 
 
+#Scatter of predicted vs actual (sample if the test set is huge)
 def _evaluation_pred_vs_actual_chart(actual: np.ndarray, predicted: np.ndarray) -> plt.Figure:
     sample_actual = np.asarray(actual, dtype=float)
     sample_predicted = np.asarray(predicted, dtype=float)
@@ -531,6 +562,7 @@ def _evaluation_pred_vs_actual_chart(actual: np.ndarray, predicted: np.ndarray) 
     return fig
 
 
+#Histogram of prediction error (predicted minus actual)
 def _evaluation_residual_chart(actual: np.ndarray, predicted: np.ndarray) -> plt.Figure:
     residuals = np.asarray(predicted, dtype=float) - np.asarray(actual, dtype=float)
     fig, ax = plt.subplots(figsize=(6.2, 3.0))
@@ -542,6 +574,7 @@ def _evaluation_residual_chart(actual: np.ndarray, predicted: np.ndarray) -> plt
     return fig
 
 
+#2x2 liked vs not-liked confusion matrix
 def _evaluation_confusion_chart(y_true: np.ndarray, y_pred: np.ndarray) -> plt.Figure:
     y_true = np.asarray(y_true, dtype=int)
     y_pred = np.asarray(y_pred, dtype=int)
@@ -577,6 +610,7 @@ def _evaluation_confusion_chart(y_true: np.ndarray, y_pred: np.ndarray) -> plt.F
     return fig
 
 
+#Chart colors used by matplotlib (white background, dark text)
 _CHART_BG = "#FFFFFF"
 _CHART_TEXT = "#222222"
 _CHART_GRID = "#D0D3DA"
@@ -589,6 +623,7 @@ SHORT_ALGORITHM_LABELS = {
 }
 
 
+#Shared look for all matplotlib charts in the app
 def _style_chart_axes(ax, ylabel: str) -> None:
     ax.set_facecolor(_CHART_BG)
     ax.figure.set_facecolor(_CHART_BG)
@@ -602,6 +637,7 @@ def _style_chart_axes(ax, ylabel: str) -> None:
     ax.set_axisbelow(True)
 
 
+#Write the numeric value on top of each bar
 def _add_bar_labels(ax, bars, values: list[float], fmt: str, offset: float) -> None:
     for bar, value in zip(bars, values, strict=True):
         ax.text(
@@ -616,6 +652,7 @@ def _add_bar_labels(ax, bars, values: list[float], fmt: str, offset: float) -> N
         )
 
 
+#Grouped bars: content vs collaborative vs hybrid on precision/recall/F1/accuracy
 def _classification_comparison_chart(comparison: pd.DataFrame) -> plt.Figure:
     """Side-by-side bars per metric so models can be compared without stacking."""
     metrics = list(CLASSIFICATION_METRICS)
@@ -650,6 +687,7 @@ def _classification_comparison_chart(comparison: pd.DataFrame) -> plt.Figure:
     return fig
 
 
+#How F1/precision/recall/accuracy change as hybrid alpha moves from SVD to content
 def _alpha_sweep_chart(tune_display: pd.DataFrame, best_alpha: float) -> plt.Figure:
     """Alpha sweep with labeled axes, zoomed y-scale, and the F1-tuned alpha marked."""
     metrics = ["Precision", "Recall", "F1-score", "Accuracy"]
@@ -704,6 +742,7 @@ def _alpha_sweep_chart(tune_display: pd.DataFrame, best_alpha: float) -> plt.Fig
     return fig
 
 
+#Zoomed F1 bars so small gaps between models are easier to see
 def _f1_comparison_chart(comparison: pd.DataFrame) -> plt.Figure:
     """Zoom the F1 axis so small gaps between models are visible."""
     algorithms = list(COMPARISON_ALGORITHMS)
@@ -727,6 +766,7 @@ def _f1_comparison_chart(comparison: pd.DataFrame) -> plt.Figure:
     return fig
 
 
+#Rank the three models: 1st = best average rank across RMSE and classification metrics
 def _comparison_ranking(comparison: pd.DataFrame) -> pd.DataFrame:
     """Rank models on RMSE (lower better) and classification metrics (higher better)."""
     ranked = comparison[["Algorithm"]].copy()
@@ -749,6 +789,7 @@ def _comparison_ranking(comparison: pd.DataFrame) -> pd.DataFrame:
 
 
 def _rank_reason(row: pd.Series) -> str:
+    #Short sentence under the place card, e.g. "Best on RMSE, F1-score"
     won = row["won_metrics"]
     if len(won) == 5:
         return "Wins every metric"
@@ -759,6 +800,7 @@ def _rank_reason(row: pd.Series) -> str:
     return "Third on every metric"
 
 
+#HTML for the 1st / 2nd / 3rd ranking cards on Model Comparison
 def _ranking_board_html(ranked: pd.DataFrame) -> str:
     n = max(len(ranked), 1)
     best = {
@@ -821,6 +863,7 @@ def _render_comparison_ranking(ranked: pd.DataFrame) -> None:
     st.html(_ranking_board_html(ranked))
 
 
+#Written summary of who won and why
 def _render_comparison_conclusion(ranked: pd.DataFrame) -> None:
     winner = ranked.iloc[0]
     second = ranked.iloc[1] if len(ranked) > 1 else None
@@ -860,6 +903,7 @@ def _render_comparison_conclusion(ranked: pd.DataFrame) -> None:
             st.markdown(" ".join(notes))
 
 
+#Remind the user posters are optional (fetch_posters.py)
 def _poster_notice(posters: pd.DataFrame) -> None:
     if posters.empty or posters["poster_url"].isna().all():
         st.info(
@@ -868,6 +912,7 @@ def _poster_notice(posters: pd.DataFrame) -> None:
         )
 
 
+#Reuse recommendations if the user/settings have not changed (avoids retraining on every click)
 def _load_recs(
     *,
     algorithm: str,
@@ -932,6 +977,7 @@ def _load_recs(
     return display, score_cols
 
 
+#Selected user's rating summary and expandable history table
 def render_user_panel(ratings: pd.DataFrame, movies: pd.DataFrame, user_id: int) -> None:
     summary = user_summary(ratings, int(user_id))
     st.html(
@@ -949,6 +995,7 @@ def render_user_panel(ratings: pd.DataFrame, movies: pd.DataFrame, user_id: int)
         st.dataframe(history, use_container_width=True, hide_index=True)
 
 
+#Optional table view under the movie cards
 def _recs_table(display: pd.DataFrame) -> None:
     with st.expander("Table view"):
         table = display.drop(columns=["imdbId", "tmdbId", "poster_url"], errors="ignore")
@@ -962,6 +1009,7 @@ def _recs_table(display: pd.DataFrame) -> None:
         )
 
 
+#Hybrid tab: top-N list plus why each movie was blended that way
 def render_hybrid_recs(
     *,
     user_id: int,
@@ -1001,6 +1049,7 @@ def render_hybrid_recs(
     _recs_table(display)
 
 
+#Hybrid tab: alpha slider explanation, blend curve, and alpha-sweep metrics
 def render_hybrid_weight(
     *,
     user_id: int,
@@ -1096,6 +1145,7 @@ def render_hybrid_weight(
     st.dataframe(tune_display, use_container_width=True, hide_index=True)
 
 
+#Hybrid tab: search a title, then show this user's predicted rating + similar movies
 def render_hybrid_search(
     *,
     user_id: int,
@@ -1224,6 +1274,7 @@ def render_hybrid_search(
         hybrid_model.alpha = previous_alpha
 
 
+#Content tab: top-N list, optional MMR diversity comparison, and why-recommended table
 def render_content_recs(
     *,
     user_id: int,
@@ -1276,6 +1327,7 @@ def render_content_recs(
     _recs_table(display)
 
 
+#Content tab: pick genres and find unseen movies close to that genre centroid
 def render_content_like_genre(
     *,
     user_id: int,
@@ -1333,6 +1385,7 @@ def render_content_like_genre(
     render_recommendation_cards(similar, [])
 
 
+#Content tab: bar chart of which genres this user likes (from ratings ≥ 3.0)
 def render_content_profile(ratings, movies, user_id: int) -> None:
     st.subheader(f"👤 Genre profile · user {user_id}")
     st.caption(
@@ -1349,6 +1402,7 @@ def render_content_profile(ratings, movies, user_id: int) -> None:
     )
 
 
+#Collaborative tab: user kNN / item kNN / SVD recommendations
 def render_collab_recs(
     *,
     user_id: int,
@@ -1426,6 +1480,7 @@ def render_collab_recs(
     _recs_table(display)
 
 
+#Shared evaluation page used by hybrid, content, and collaborative tabs
 def render_evaluation(algorithm_label: str, algorithm: str, all_eval, train_size, test_size) -> None:
     st.subheader("Evaluation (80/20 split)")
     st.caption(
@@ -1461,6 +1516,7 @@ def render_evaluation(algorithm_label: str, algorithm: str, all_eval, train_size
         st.pyplot(_evaluation_confusion_chart(y_true, y_pred), clear_figure=True, width="content")
 
 
+#Side-by-side metrics for content vs collaborative vs hybrid
 def render_comparison(all_metrics, best_alpha: float, tuning_results: pd.DataFrame) -> None:
     st.subheader("Model Comparison")
     st.caption(
@@ -1505,6 +1561,7 @@ def render_comparison(all_metrics, best_alpha: float, tuning_results: pd.DataFra
     _render_comparison_conclusion(ranked)
 
 
+#EDA charts from data_visualization.py (ratings, genres, sparsity, long tail)
 def render_visualization(data_sig: str, ratings, movies) -> None:
     st.subheader("Data Visualization")
     st.caption("Exploratory analysis of the cleaned MovieLens dataset.")
@@ -1590,6 +1647,7 @@ def render_visualization(data_sig: str, ratings, movies) -> None:
     )
 
 
+#Browse the cleaned CSVs (movies, ratings, links, posters)
 def render_explorer(movies, ratings, links, posters) -> None:
     st.subheader("Data Explorer")
     filled_pct, n_users, _n_rated_movies = data_visualization.sparsity_stats(ratings)
@@ -1625,6 +1683,7 @@ def render_explorer(movies, ratings, links, posters) -> None:
             st.dataframe(posters, use_container_width=True, hide_index=True)
 
 
+#Main page: user panel + pills that switch Hybrid / Content / CF / Comparison / Viz / Explorer
 def render_home(
     *,
     ratings,
@@ -1654,6 +1713,7 @@ def render_home(
     cf_n_components: int,
 ) -> None:
     render_user_panel(ratings, movies, int(user_id))
+    #Which algorithm / page is selected
     section = st.pills(
         "Page",
         MAIN_TABS,
@@ -1721,6 +1781,7 @@ def render_home(
         render_explorer(movies, ratings, links, posters)
 
 
+#Hybrid page: recommendations, search, blend weights, evaluation
 def render_hybrid_page(
     *,
     user_id: int,
@@ -1800,6 +1861,7 @@ def render_hybrid_page(
         )
 
 
+#Content-based page: recommendations, like-this-genre, genre profile, evaluation
 def render_content_page(
     *,
     user_id: int,
@@ -1866,6 +1928,7 @@ def render_content_page(
         )
 
 
+#Collaborative page: recommendations + SVD evaluation
 def render_collab_page(
     *,
     user_id: int,
@@ -1924,6 +1987,7 @@ def render_collab_page(
 
 
 def main() -> None:
+    #Page styling (white background, movie cards, ranking board)
     st.markdown(
         """
         <style>
@@ -2256,6 +2320,7 @@ def main() -> None:
     st.title("🎬 Movie Recommendation System")
     st.html('<div class="hero-bar"></div>')
 
+    #Retrain only when the cleaned CSV files change
     data_sig = processed_data_signature()
 
     try:
@@ -2282,7 +2347,8 @@ def main() -> None:
         st.info("Run `py data_preprocessing.py --output-dir processed` first.")
         return
 
-    # Cached instances can keep an older class after a module reload.
+    #Cached instances can keep an older class after a module reload.
+    #Re-bind the class so method lookups use the latest code.
     hybrid_model.__class__ = hybrid.HybridRecommender
     hybrid_model.content_model.__class__ = content_based.ContentBasedRecommender
     content_model.__class__ = content_based.ContentBasedRecommender
@@ -2294,6 +2360,7 @@ def main() -> None:
 
     rating_stats = movie_rating_stats(ratings)
 
+    #Sidebar: user, top-N, and extra knobs that depend on the current page
     with st.sidebar:
         st.header("Settings")
         user_id = st.selectbox(
@@ -2312,6 +2379,7 @@ def main() -> None:
         cf_item_method = collaborative_filtering.DEFAULT_ITEM_METHOD
         cf_n_components = collaborative_filtering.DEFAULT_N_COMPONENTS
         if section == "🔀 Hybrid":
+            #Reset alpha to the F1-tuned value when cleaned data or the tuned alpha changes
             alpha_token = (data_sig, round(float(best_alpha), 4))
             if st.session_state.get("_alpha_token") != alpha_token:
                 st.session_state.hybrid_alpha = float(best_alpha)
@@ -2337,6 +2405,7 @@ def main() -> None:
             st.cache_data.clear()
             st.rerun()
 
+    #Draw the selected page with the sidebar settings
     render_home(
         ratings=ratings,
         movies=movies,

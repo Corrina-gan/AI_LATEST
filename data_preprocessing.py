@@ -1,5 +1,6 @@
 """Data cleaning and preprocessing for the MovieLens ml-latest-small dataset."""
 
+#Imports
 from __future__ import annotations
 
 import argparse
@@ -8,9 +9,11 @@ from pathlib import Path
 
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parent / "dataset"
-PROCESSED_DIR = Path(__file__).resolve().parent / "processed"
+#Constant
+DATA_DIR = Path(__file__).resolve().parent / "dataset" #raw MovieLens CSV files
+PROCESSED_DIR = Path(__file__).resolve().parent / "processed" #cleaned files go here
 
+#Official MovieLens genre labels. Anything else is flagged as unexpected.
 VALID_GENRES = {
     "Action",
     "Adventure",
@@ -34,12 +37,12 @@ VALID_GENRES = {
     "(no genres listed)",
 }
 
-# Screening formats, not story genres. Strip these from genre_list / TF-IDF.
+#Screening formats, not story genres. Strip these from genre_list / TF-IDF.
 DROPPED_GENRE_LABELS = frozenset({"IMAX"})
 
-# Repeat genres so TF-IDF does not get drowned out by noisy free-text tags.
+#Repeat genres so TF-IDF does not get drowned out by noisy free-text tags.
 GENRE_REPEAT = 3
-MIN_TAG_COUNT = 2
+MIN_TAG_COUNT = 2 #ignore tags that appear only once in the whole dataset
 CONTENT_VECTORIZER_PARAMS = {
     "stop_words": "english",
     "ngram_range": (1, 2),
@@ -48,13 +51,14 @@ CONTENT_VECTORIZER_PARAMS = {
     "sublinear_tf": True,
 }
 
+#Hyphenated genres become one token so TF-IDF does not split them apart.
 GENRE_TOKEN_MAP = {
     "Sci-Fi": "SciFi",
     "Film-Noir": "FilmNoir",
     "Children's": "Children",
 }
 
-# Watch-status / queue tags add no movie content signal.
+#Watch-status / queue tags add no movie content signal.
 TAG_STOPWORDS = frozenset(
     {
         "in netflix queue",
@@ -79,6 +83,7 @@ TAG_STOPWORDS = frozenset(
 )
 
 
+#Load the 4 raw MovieLens CSV files from the dataset folder
 def load_raw_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
     """Load raw MovieLens CSV files."""
     return {
@@ -89,34 +94,37 @@ def load_raw_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
     }
 
 
+#Turn "Action|Adventure|IMAX" into a clean list of story genres
 def _normalize_genre_list(genres: object) -> list[str]:
     """Drop non-genre labels such as IMAX; keep a placeholder if nothing remains."""
     if isinstance(genres, list):
         raw = genres
     else:
-        raw = str(genres).split("|")
+        raw = str(genres).split("|") #MovieLens stores genres as Action|Comedy|Drama
     cleaned = [
         genre.strip()
         for genre in raw
         if str(genre).strip()
-        and str(genre).strip() not in DROPPED_GENRE_LABELS
+        and str(genre).strip() not in DROPPED_GENRE_LABELS #drop IMAX and empty labels
     ]
-    return cleaned or ["(no genres listed)"]
+    return cleaned or ["(no genres listed)"] #never leave a movie with zero genres
 
 
+#Clean movie titles, extract the release year, and split genres
 def clean_movies(movies: pd.DataFrame) -> pd.DataFrame:
     """Clean movie metadata and derive useful columns."""
     movies = movies.copy()
     movies["title"] = movies["title"].astype(str).str.strip()
     movies["genres"] = movies["genres"].fillna("(no genres listed)").astype(str).str.strip()
 
-    # Extract release year from titles like "Toy Story (1995)".
+    #Extract release year from titles like "Toy Story (1995)"
     year_match = movies["title"].str.extract(r"\((\d{4})\)\s*$")
     movies["year"] = pd.to_numeric(year_match[0], errors="coerce").astype("Int64")
 
-    # Split pipe-separated genres, drop IMAX, and rebuild the joined string.
+    #Split pipe-separated genres, drop IMAX, and rebuild the joined string
     movies["genre_list"] = movies["genres"].str.split("|").map(_normalize_genre_list)
     movies["genres"] = movies["genre_list"].map(lambda parts: "|".join(parts))
+    #Warn if any leftover label is not in the official MovieLens genre set
     invalid_genre_mask = movies["genre_list"].apply(
         lambda genres: any(genre not in VALID_GENRES for genre in genres)
     )
@@ -127,6 +135,7 @@ def clean_movies(movies: pd.DataFrame) -> pd.DataFrame:
     return movies.drop_duplicates(subset="movieId", keep="first").reset_index(drop=True)
 
 
+#Clean ratings: keep valid scores, known movies, and one rating per user-movie pair
 def clean_ratings(
     ratings: pd.DataFrame,
     valid_movie_ids: set[int],
@@ -136,6 +145,7 @@ def clean_ratings(
     """Clean ratings and keep only records tied to known movies."""
     ratings = ratings.copy()
 
+    #Force IDs and scores to numbers; bad values become NaN
     ratings["userId"] = pd.to_numeric(ratings["userId"], errors="coerce").astype("Int64")
     ratings["movieId"] = pd.to_numeric(ratings["movieId"], errors="coerce").astype("Int64")
     ratings["rating"] = pd.to_numeric(ratings["rating"], errors="coerce")
@@ -143,13 +153,15 @@ def clean_ratings(
 
     ratings = ratings.dropna(subset=["userId", "movieId", "rating", "timestamp"])
 
+    #MovieLens uses half-star scores from 0.5 to 5.0
     valid_rating_mask = ratings["rating"].between(min_rating, max_rating)
     half_star_mask = (ratings["rating"] * 2).round().eq(ratings["rating"] * 2)
     ratings = ratings.loc[valid_rating_mask & half_star_mask]
 
+    #Drop ratings for movies that are not in the movies table
     ratings = ratings.loc[ratings["movieId"].isin(valid_movie_ids)]
 
-    # Keep the latest rating when duplicate user-movie pairs exist.
+    #Keep the latest rating when the same user rated the same movie more than once
     ratings = (
         ratings.sort_values("timestamp")
         .drop_duplicates(subset=["userId", "movieId"], keep="last")
@@ -160,6 +172,7 @@ def clean_ratings(
     return ratings
 
 
+#Clean tags: lowercase/normalize text, drop empty tags and unknown movies
 def clean_tags(tags: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
     """Normalize tags and remove rows that do not map to known movies."""
     tags = tags.copy()
@@ -173,6 +186,7 @@ def clean_tags(tags: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
     tags = tags.loc[tags["tag"].ne("")]
     tags = tags.loc[tags["movieId"].isin(valid_movie_ids)]
 
+    #Keep the latest copy of the same user/movie/tag
     tags = (
         tags.sort_values("timestamp")
         .drop_duplicates(subset=["userId", "movieId", "tag"], keep="last")
@@ -181,11 +195,12 @@ def clean_tags(tags: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
 
     tags["tag_standardization"] = tags["tag"].map(_normalize_tag)
     tags = tags.loc[tags["tag_standardization"].ne("")]
-    tags = tags.loc[~tags["tag_standardization"].isin(TAG_STOPWORDS)]
+    tags = tags.loc[~tags["tag_standardization"].isin(TAG_STOPWORDS)] #drop "watched", "netflix", etc.
     tags["tagged_at"] = pd.to_datetime(tags["timestamp"], unit="s", utc=True)
     return tags.reset_index(drop=True)
 
 
+#Clean IMDb / TMDb IDs used to look movies up on other sites
 def clean_links(links: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
     """Clean external movie identifiers."""
     links = links.copy()
@@ -200,6 +215,7 @@ def clean_links(links: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
     return links
 
 
+#Drop inactive users and rarely rated movies, then repeat until nothing else is removed
 def filter_by_activity(
     ratings: pd.DataFrame,
     min_user_ratings: int = 20,
@@ -215,14 +231,17 @@ def filter_by_activity(
     filtered = ratings.copy()
 
     while True:
+        #Keep users who still have enough ratings
         user_counts = filtered["userId"].value_counts()
         active_users = set(user_counts[user_counts >= min_user_ratings].index)
         filtered = filtered.loc[filtered["userId"].isin(active_users)]
 
+        #Then keep movies that still have enough ratings
         movie_counts = filtered["movieId"].value_counts()
         active_movies = set(movie_counts[movie_counts >= min_movie_ratings].index)
         next_filtered = filtered.loc[filtered["movieId"].isin(active_movies)]
 
+        #Stop when a pass removes nobody
         if len(next_filtered) == len(filtered):
             break
         filtered = next_filtered
@@ -230,19 +249,22 @@ def filter_by_activity(
     return filtered.reset_index(drop=True)
 
 
+#Lowercase a tag and strip punctuation so "Sci-Fi!" and "sci fi" match
 def _normalize_tag(tag: object) -> str:
     text = str(tag).lower().strip()
     text = re.sub(r"[^a-z0-9\s]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
+#Title text for TF-IDF: drop the year, keep letters/numbers only
 def _title_feature_text(title: object) -> str:
     text = str(title)
-    text = re.sub(r"\s*\(\d{4}\)\s*$", "", text)
+    text = re.sub(r"\s*\(\d{4}\)\s*$", "", text) #remove "(1995)" from the end
     text = re.sub(r"[^a-zA-Z0-9\s]+", " ", text)
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
+#Genre text for TF-IDF: repeat each genre so it outweighs noisy tags
 def _genre_feature_text(genres: object) -> str:
     raw = str(genres).strip()
     if not raw or raw == "(no genres listed)":
@@ -254,10 +276,11 @@ def _genre_feature_text(genres: object) -> str:
             continue
         token = GENRE_TOKEN_MAP.get(genre, re.sub(r"[^A-Za-z0-9]+", "", genre))
         if token:
-            tokens.extend([token] * GENRE_REPEAT)
+            tokens.extend([token] * GENRE_REPEAT) #repeat 3 times so genres stay important
     return " ".join(tokens)
 
 
+#Year text for TF-IDF, e.g. "year_1995 decade_1990s"
 def _year_feature_text(year: object) -> str:
     try:
         if pd.isna(year):
@@ -271,6 +294,7 @@ def _year_feature_text(year: object) -> str:
     return f"year_{year_int} decade_{decade}s"
 
 
+#Build one text field per movie for the content-based model
 def build_movie_content(movies: pd.DataFrame, tags: pd.DataFrame) -> pd.DataFrame:
     """
     Combine title, year, boosted genres, and cleaned tags into one TF-IDF field.
@@ -282,6 +306,7 @@ def build_movie_content(movies: pd.DataFrame, tags: pd.DataFrame) -> pd.DataFram
     if "year" in movies.columns:
         movie_content["year"] = movies["year"]
     else:
+        #If year was not cleaned yet, pull it from the title
         year_match = movie_content["title"].str.extract(r"\((\d{4})\)\s*$")
         movie_content["year"] = pd.to_numeric(year_match[0], errors="coerce").astype("Int64")
 
@@ -289,10 +314,12 @@ def build_movie_content(movies: pd.DataFrame, tags: pd.DataFrame) -> pd.DataFram
     movie_content["year_text"] = movie_content["year"].map(_year_feature_text)
     movie_content["genres_text"] = movie_content["genres"].map(_genre_feature_text)
 
+    #Attach cleaned tags, then fill movies that have none
     tag_text = _prepare_tag_text(tags)
     movie_content = movie_content.merge(tag_text, on="movieId", how="left")
     movie_content["tags"] = movie_content["tags"].fillna("")
 
+    #Join title + year + genres + tags into one string for TF-IDF
     movie_content["content_features"] = (
         movie_content[["title_text", "year_text", "genres_text", "tags"]]
         .fillna("")
@@ -303,6 +330,7 @@ def build_movie_content(movies: pd.DataFrame, tags: pd.DataFrame) -> pd.DataFram
     return movie_content
 
 
+#Group tags by movie: drop rare/stopword tags, keep unique tags in one string
 def _prepare_tag_text(tags: pd.DataFrame) -> pd.DataFrame:
     if tags.empty:
         return pd.DataFrame(columns=["movieId", "tags"])
@@ -313,17 +341,19 @@ def _prepare_tag_text(tags: pd.DataFrame) -> pd.DataFrame:
     prepared = prepared.loc[prepared[tag_column].ne("")]
     prepared = prepared.loc[~prepared[tag_column].isin(TAG_STOPWORDS)]
 
+    #Drop tags that appear only once in the whole dataset
     tag_counts = prepared[tag_column].value_counts()
     keep_tags = set(tag_counts[tag_counts >= MIN_TAG_COUNT].index)
     prepared = prepared.loc[prepared[tag_column].isin(keep_tags)]
 
     return (
         prepared.groupby("movieId")[tag_column]
-        .apply(lambda values: " ".join(dict.fromkeys(values)))
+        .apply(lambda values: " ".join(dict.fromkeys(values))) #keep unique tags, original order
         .reset_index(name="tags")
     )
 
 
+#Print a short overview after cleaning
 def summarize_data(
     movies: pd.DataFrame,
     ratings: pd.DataFrame,
@@ -345,6 +375,7 @@ def summarize_data(
     print(f"Movies with year: {int(movies['year'].notna().sum()):,}" if "year" in movies.columns else "")
 
 
+#Full pipeline: load -> clean -> filter -> build content text -> save CSV files
 def preprocess_dataset(
     data_dir: Path = DATA_DIR,
     output_dir: Path = PROCESSED_DIR,
@@ -365,6 +396,7 @@ def preprocess_dataset(
         min_movie_ratings=min_movie_ratings,
     )
 
+    #After activity filtering, drop movies that no longer have ratings
     active_movie_ids = set(ratings["movieId"].astype(int))
     movies = movies.loc[movies["movieId"].isin(active_movie_ids)].reset_index(drop=True)
 
