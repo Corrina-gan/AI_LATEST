@@ -30,33 +30,6 @@ DEFAULT_ALPHA_GRID = [0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80] #alp
 CLASSIFICATION_THRESHOLDS = np.round(np.arange(2.5, 4.25, 0.05), 2) #try many cutoffs to find the best F1
 ITEM_SUPPORT_SHRINK = 25.0 #how fast the blend moves from content to SVD when a movie has more ratings
 MIN_CONTENT_MIX = 0.25 #content always keeps at least this share of the mix
-HYBRID_RARE_MAX = 15 #movies with this many ratings or fewer lean on content
-HYBRID_POPULAR_MIN = 120 #movies with this many ratings or more stay closer to SVD
-EXAMPLE_MIX_COUNTS = (0, 50, 120) #example rating counts shown on the weight page
-
-#Genre colours for the hybrid "why this mix?" table (kept local so hybrid does not import content_based.py)
-GENRE_COLORS = {
-    "Action": "#2EC4B6",
-    "Adventure": "#7BD389",
-    "Animation": "#F4D35E",
-    "Children": "#90BE6D",
-    "Comedy": "#FFB703",
-    "Crime": "#2A9D8F",
-    "Documentary": "#4CC9F0",
-    "Drama": "#4C9AFF",
-    "Fantasy": "#7B5EA7",
-    "Film-Noir": "#4A4E69",
-    "Horror": "#9B2226",
-    "IMAX": "#48CAE4",
-    "Musical": "#E5989B",
-    "Mystery": "#577590",
-    "Romance": "#F4A261",
-    "Sci-Fi": "#E76F51",
-    "Thriller": "#E63946",
-    "War": "#52B788",
-    "Western": "#BC6C25",
-}
-DEFAULT_GENRE_COLOR = "#6B7280"
 
 
 #Rating range validation
@@ -166,31 +139,11 @@ def _hybrid_score_columns(frame: pd.DataFrame) -> tuple[str, str, str]:
     return content, collaborative, hybrid
 
 
-#Split "Action|Comedy|Drama" into a clean list of genre names
-def split_movie_genres(value: object) -> list[str]:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return []
-    if isinstance(value, list):
-        parts = [str(item).strip() for item in value]
-    else:
-        parts = str(value).split("|")
-    return [
-        part.strip()
-        for part in parts
-        if part.strip() and part.strip() != "(no genres listed)"
-    ]
-
-
-def genre_pill_html(genre: str) -> str:
-    from html import escape
-
-    color = GENRE_COLORS.get(genre, DEFAULT_GENRE_COLOR)
-    return f'<span class="genre-pill" style="background:{color}">{escape(genre)}</span>'
-
-
 #Build a HTML table to explain why each movie got this mix
 def explain_blend_table_html(frame: pd.DataFrame, reasons: dict[int, list[str]]) -> str:
     from html import escape
+
+    from content_based import genre_pill_html, split_movie_genres
 
     content_col, cf_col, hybrid_col = _hybrid_score_columns(frame)
     rows_html: list[str] = []
@@ -204,7 +157,9 @@ def explain_blend_table_html(frame: pd.DataFrame, reasons: dict[int, list[str]])
         content = float(row.get(content_col, 0.0) or 0.0)
         cf_score = float(row.get(cf_col, 0.0) or 0.0)
         hybrid_score = float(row.get(hybrid_col, 0.0) or 0.0)
-        why_bits = reasons.get(movie_id, [])
+        genre_set = set(genres)
+        #Don't show genre names again in the why column
+        why_bits = [item for item in reasons.get(movie_id, []) if item not in genre_set]
         why = "".join(
             f'<div class="why-line">✓ {escape(item)}</div>' for item in why_bits
         ) or '<span class="why-empty">Support-aware hybrid blend</span>'
@@ -228,6 +183,59 @@ def explain_blend_table_html(frame: pd.DataFrame, reasons: dict[int, list[str]])
         "</tr></thead>"
         f"<tbody>{''.join(rows_html)}</tbody></table>"
     )
+
+
+#Plotting content vs SVD vs hybrid scores
+def plot_score_breakdown(frame: pd.DataFrame):
+    import matplotlib.pyplot as plt
+
+    content_col, cf_col, hybrid_col = _hybrid_score_columns(frame)
+    #Shorten long movie titles so they fit on the x axis
+    labels = [
+        str(title)[:26] + ("…" if len(str(title)) > 26 else "")
+        for title in frame["title"].tolist()
+    ]
+    content = frame[content_col].astype(float).to_numpy()
+    collaborative = frame[cf_col].astype(float).to_numpy()
+    hybrid_scores = frame[hybrid_col].astype(float).to_numpy()
+    stacked = np.concatenate([content, collaborative, hybrid_scores])
+    #Zoom the y axis around the scores so the bars are easier to compare
+    y_min = max(0.0, float(np.nanmin(stacked)) - 0.2)
+    y_max = min(5.35, float(np.nanmax(stacked)) + 0.15)
+    if y_max - y_min < 0.7:
+        mid = (y_min + y_max) / 2
+        y_min = max(0.0, mid - 0.45)
+        y_max = min(5.35, mid + 0.45)
+
+    x = list(range(len(frame)))
+    width = 0.26
+    fig, ax = plt.subplots(figsize=(8.2, 4.0)) #create the chart, width = 8.2, height = 4.0
+    #Background colour
+    fig.patch.set_facecolor("#FFFFFF")
+    ax.set_facecolor("#FFFFFF")
+    ax.bar([pos - width for pos in x], content, width, label="Content", color="#5B8FF9")
+    ax.bar(x, collaborative, width, label="Collaborative (SVD)", color="#5AD8A6")
+    ax.bar([pos + width for pos in x], hybrid_scores, width, label="Hybrid", color="#E85D75")
+    ax.set_xticks(x, labels, rotation=28, ha="right")
+    ax.set_ylabel("Predicted rating (zoomed)")
+    ax.set_ylim(y_min, y_max)
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("#C5C9D3")
+    legend = ax.legend(
+        frameon=True,
+        fontsize=8,
+        ncol=3,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.14),
+        facecolor="#FFFFFF",
+        edgecolor="#D0D3DA",
+    )
+    legend.get_frame().set_alpha(1)
+    fig.tight_layout()
+    return fig
 
 
 #Plotting how the blend weight changes when a movie has more ratings
@@ -267,114 +275,9 @@ def plot_blend_weights(
     fig.tight_layout()
     return fig
 
-
-def example_mix_at_counts(
-    alpha: float,
-    counts: tuple[int, ...] = EXAMPLE_MIX_COUNTS,
-    shrink: float = ITEM_SUPPORT_SHRINK,
-    min_mix: float = MIN_CONTENT_MIX,
-) -> list[tuple[int, float, float]]:
-    movie_ids = np.arange(len(counts))
-    item_counts = {int(index): int(count) for index, count in enumerate(counts)}
-    details = blend_hybrid_details(
-        np.full(len(counts), 4.0),
-        np.full(len(counts), 4.0),
-        movie_ids,
-        item_counts,
-        float(alpha),
-        shrink=shrink,
-        min_mix=min_mix,
-    )
-    return [
-        (int(count), float(details["content_weight"][index]), float(details["cf_weight"][index]))
-        for index, count in enumerate(counts)
-    ]
-
-
-def plot_example_mix(
-    alpha: float,
-    shrink: float = ITEM_SUPPORT_SHRINK,
-    min_mix: float = MIN_CONTENT_MIX,
-):
-    import matplotlib.pyplot as plt
-
-    mix = example_mix_at_counts(alpha, shrink=shrink, min_mix=min_mix)
-    labels = [
-        "Rare\n(0 ratings)",
-        "In between\n(50 ratings)",
-        "Popular\n(120 ratings)",
-    ]
-    content = [row[1] * 100 for row in mix]
-    collaborative = [row[2] * 100 for row in mix]
-    x = np.arange(len(labels))
-    width = 0.36
-
-    fig, ax = plt.subplots(figsize=(6.6, 3.2))
-    fig.patch.set_facecolor("#FFFFFF")
-    ax.set_facecolor("#FFFFFF")
-    ax.bar(x - width / 2, content, width, label="Content", color="#5B8FF9")
-    ax.bar(x + width / 2, collaborative, width, label="Collaborative (SVD)", color="#5AD8A6")
-    ax.set_xticks(x, labels)
-    ax.set_ylabel("Blend share (%)")
-    ax.set_ylim(0, 105)
-    ax.legend(frameon=False, fontsize=8, loc="upper right")
-    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
-    ax.set_axisbelow(True)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
-    return fig
-
-
-def catalog_popularity_counts(item_counts: dict[int, int]) -> tuple[int, int, int]:
-    rare = mid = popular = 0
-    for count in item_counts.values():
-        if int(count) <= HYBRID_RARE_MAX:
-            rare += 1
-        elif int(count) >= HYBRID_POPULAR_MIN:
-            popular += 1
-        else:
-            mid += 1
-    return rare, mid, popular
-
-
-def plot_catalog_popularity(item_counts: dict[int, int]):
-    import matplotlib.pyplot as plt
-
-    rare, mid, popular = catalog_popularity_counts(item_counts)
-    labels = [
-        f"Rarely rated\n(≤{HYBRID_RARE_MAX} ratings)\nmore content",
-        f"In between\n({HYBRID_RARE_MAX + 1}–{HYBRID_POPULAR_MIN - 1})\nmixed",
-        f"Popular\n(≥{HYBRID_POPULAR_MIN} ratings)\nmore SVD",
-    ]
-    values = [rare, mid, popular]
-    colors = ["#E85D75", "#5B8FF9", "#5AD8A6"]
-
-    fig, ax = plt.subplots(figsize=(6.6, 3.4))
-    fig.patch.set_facecolor("#FFFFFF")
-    ax.set_facecolor("#FFFFFF")
-    bars = ax.bar(labels, values, color=colors, width=0.65)
-    ax.set_ylabel("Number of movies")
-    ax.set_title("How many movies fall into each blend band")
-    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
-    ax.set_axisbelow(True)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    for bar, value in zip(bars, values, strict=True):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{value:,}",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-        )
-    ax.margins(y=0.14)
-    fig.tight_layout()
-    return fig
-
-
-#ContentBasedRecommender class
+#----------------------------------------------------------------------------------------
+#ContentBased Recommender 
+#----------------------------------------------------------------------------------------
 #Genre + tags -> TF-IDF -> cosine similarity.
 #Star ratings are only used as "movies this user has seen", not as profile weights.
 #This class is only used by HybridRecommender so both models can be blended later.
@@ -529,7 +432,9 @@ class ContentBasedRecommender:
         return [int(self.movie_ids[candidate_indices[index]]) for index in top_indices]
 
 
-#CollaborativeFilteringRecommender class
+#----------------------------------------------------------------------------------------
+#Collaborative Filtering Recommender 
+#----------------------------------------------------------------------------------------
 #TruncatedSVD = matrix factorization, finds hidden patterns in the rating matrix
 #Example: users who like the same movies will have similar latent factors
 class CollaborativeFilteringRecommender:
@@ -769,7 +674,9 @@ def split_train_test(
     return train_df, test_df
 
 
-#HybridRecommender class
+#----------------------------------------------------------------------------------------
+#Hybrid Recommender 
+#----------------------------------------------------------------------------------------
 #This model combines two methods:
 #1. Content-based = genres/tags -> TF-IDF -> cosine similarity
 #2. Collaborative = SVD matrix factorization
@@ -918,57 +825,39 @@ class HybridRecommender:
         )
         return scored.sort_values("score_gap", ascending=False).head(n_movies).reset_index(drop=True)
 
-    #Explain Why this mix: blend weights first, then why those weights were used
-    def recommendation_reasons(self, row: pd.Series, user_id: int | None = None) -> list[str]:
-        del user_id  # mix reasons come from weights and rating support, not genres
-        raw_count = row.get("n_ratings", row.get("rating_count", 0))
-        if raw_count is None or (isinstance(raw_count, float) and pd.isna(raw_count)):
-            raw_count = row.get("rating_count", 0)
-        count = int(raw_count or 0)
-        raw_weight = row.get("content_weight")
-        if raw_weight is None or (isinstance(raw_weight, float) and pd.isna(raw_weight)):
-            content_weight = 0.5
-        else:
-            content_weight = float(raw_weight)
-        cf_weight = 1.0 - content_weight
+    #Explain Why a Movie Was Recommended
+    def recommendation_reasons(self, row: pd.Series, user_id: int | None = None) -> list[str]: #return a list of reason
+        count = int(row.get("rating_count", 0) or 0)
+        content_weight = float(row.get("content_weight", 0.5) or 0.5)
         content_score = float(row.get("content_rating", row.get("Content score", 0.0)) or 0.0)
         cf_score = float(row.get("cf_rating", row.get("Collaborative score", 0.0)) or 0.0)
-
-        if content_weight > 0.5:
-            influence = "Content has the stronger influence."
-        elif content_weight < 0.5:
-            influence = "SVD has the stronger influence."
-        else:
-            influence = "the mix is even."
-
-        reasons = [
-            f"{content_weight:.0%} Content / {cf_weight:.0%} SVD — {influence}"
-        ]
+        source = str(row.get("blend_source", blend_source_label(content_weight)))
+        reasons: list[str] = []
+        if user_id is not None:
+            if getattr(self.content_model, "movies", None) is None:
+                self.content_model.movies = self.movies
+            if hasattr(self.content_model, "recommendation_reasons"):
+                reasons.extend(
+                    self.content_model.recommendation_reasons(
+                        int(user_id), int(row["movieId"])
+                    )[:4]
+                )
+        reasons.append(f"{source}: {content_weight:.0%} content / {1.0 - content_weight:.0%} SVD")
         if count <= 15:
-            reasons.append(
-                f"Rarely rated ({count} ratings) — content helps compensate for limited rating data."
-            )
+            reasons.append(f"Rarely rated ({count} ratings), so content has more influence")
         elif count >= 120:
-            reasons.append(
-                f"Popular movie ({count} ratings) — SVD has more influence because the rating history is stronger."
-            )
+            reasons.append(f"Popular movie ({count} ratings), so SVD has more influence")
         else:
-            reasons.append(
-                f"{count} ratings in the training data — the mix sits between content and SVD."
-            )
-
-        gap = abs(cf_score - content_score)
+            reasons.append(f"{count} ratings in the training data")
+        gap = content_score - cf_score
         if gap >= 0.35:
-            if cf_score > content_score:
-                reasons.append(
-                    f"SVD score: {cf_score:.2f} vs Content: {content_score:.2f} — "
-                    "collaborative filtering strongly favors this movie."
-                )
-            else:
-                reasons.append(
-                    f"Content score: {content_score:.2f} vs SVD: {cf_score:.2f} — "
-                    "content strongly favors this movie."
-                )
+            reasons.append(
+                f"Content likes it more ({content_score:.2f} vs SVD {cf_score:.2f})"
+            )
+        elif gap <= -0.35:
+            reasons.append(
+                f"People like you like it more (SVD {cf_score:.2f} vs content {content_score:.2f})"
+            )
         return reasons
 
     #Search movies by title and/or genre

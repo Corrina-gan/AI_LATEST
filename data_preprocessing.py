@@ -130,6 +130,9 @@ def load_raw_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
         "links": links,
     }
 
+#--------------------------------------------------------------------------------
+# Movie Cleaning
+#--------------------------------------------------------------------------------
 #Turn "Action|Adventure|IMAX" into a clean list of story genres
 def _normalize_genre_list(genres: object) -> list[str]:
     """Drop non-genre labels such as IMAX; keep a placeholder if nothing remains."""
@@ -171,6 +174,9 @@ def clean_movies(movies: pd.DataFrame) -> pd.DataFrame:
     return movies.drop_duplicates(subset="movieId", keep="first").reset_index(drop=True)
 
 
+#-------------------------------------------------------------------------------
+# Ratings Cleaning
+#-------------------------------------------------------------------------------
 #Clean ratings: keep valid scores, known movies, and one rating per user-movie pair
 def clean_ratings(
     ratings: pd.DataFrame,
@@ -208,6 +214,9 @@ def clean_ratings(
     return ratings
 
 
+#-------------------------------------------------------------------------------
+# Tags Cleaning
+#-------------------------------------------------------------------------------
 #Clean tags: lowercase/normalize text, drop empty tags and unknown movies
 def clean_tags(tags: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
     """Normalize tags and remove rows that do not map to known movies."""
@@ -236,6 +245,9 @@ def clean_tags(tags: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
     return tags.reset_index(drop=True)
 
 
+#--------------------------------------------------------------------------------
+# Links Cleaning
+#--------------------------------------------------------------------------------
 #Clean IMDb / TMDb IDs used to look movies up on other sites
 def clean_links(links: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
     """Clean external movie identifiers."""
@@ -249,7 +261,6 @@ def clean_links(links: pd.DataFrame, valid_movie_ids: set[int]) -> pd.DataFrame:
     links = links.loc[links["movieId"].isin(valid_movie_ids)]
     links = links.drop_duplicates(subset="movieId", keep="first").reset_index(drop=True)
     return links
-
 
 #Drop inactive users and rarely rated movies, then repeat until nothing else is removed
 def filter_by_activity(
