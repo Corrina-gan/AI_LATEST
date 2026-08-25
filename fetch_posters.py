@@ -29,18 +29,20 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+#Constant
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "processed"
-LINKS_PATH = DATA_DIR / "links_clean.csv"
-POSTERS_PATH = DATA_DIR / "posters.csv"
+LINKS_PATH = DATA_DIR / "links_clean.csv" #TMDb / IMDb IDs from preprocessing
+POSTERS_PATH = DATA_DIR / "posters.csv" #output the Streamlit app reads
 ENV_PATH = BASE_DIR / ".env"
 
-POSTER_BASE_URL = "https://image.tmdb.org/t/p/w342"
+POSTER_BASE_URL = "https://image.tmdb.org/t/p/w342" #medium poster size for the movie cards
 REQUEST_TIMEOUT = 10
-REQUESTS_PER_SECOND = 10
-SAVE_EVERY = 100
+REQUESTS_PER_SECOND = 10 #stay under TMDB's rate limit
+SAVE_EVERY = 100 #write posters.csv often so a crash does not lose progress
 
 
+#Read TMDB_API_KEY from .env without overwriting a key already set in the shell
 def load_env_file(path: Path = ENV_PATH) -> None:
     if not path.exists():
         return
@@ -68,6 +70,7 @@ if not API_KEY:
     )
 
 
+#Look up a poster by TMDb movie id
 def fetch_poster_path(tmdb_id, session):
     url = f"https://api.themoviedb.org/3/movie/{int(tmdb_id)}"
     try:
@@ -76,6 +79,7 @@ def fetch_poster_path(tmdb_id, session):
         return None
 
     if resp.status_code == 429:
+        #TMDB asked us to slow down; wait, then retry this movie
         retry_after = float(resp.headers.get("Retry-After", 1))
         time.sleep(retry_after)
         return fetch_poster_path(tmdb_id, session)
@@ -86,6 +90,7 @@ def fetch_poster_path(tmdb_id, session):
     return resp.json().get("poster_path")
 
 
+#Fallback: find the TMDb movie using its IMDb id (tt0000001 style)
 def fetch_poster_path_imdb(imdb_id, session):
     if pd.isna(imdb_id):
         return None
@@ -106,6 +111,7 @@ def fetch_poster_path_imdb(imdb_id, session):
     return results[0].get("poster_path")
 
 
+#Last fallback: search TMDb by title (drop the "(1995)" year suffix)
 def fetch_poster_path_title(title, session):
     if not isinstance(title, str) or not title.strip():
         return None
@@ -126,6 +132,7 @@ def fetch_poster_path_title(title, session):
     return results[0].get("poster_path")
 
 
+#Try TMDb id, then IMDb id, then title until one returns a poster path
 def resolve_poster_path(row, session):
     path = None
     if pd.notna(row.get("tmdbId")):
@@ -137,6 +144,7 @@ def resolve_poster_path(row, session):
     return path
 
 
+#Write posters.csv through a temp file so a crash cannot leave a half-written CSV
 def save(done, rows):
     """Merge freshly fetched rows into done and write posters.csv atomically."""
     merged = pd.concat([done, pd.DataFrame(rows)], ignore_index=True)
@@ -149,11 +157,13 @@ def save(done, rows):
     return merged
 
 
+#True when this row has no usable poster URL
 def _missing_poster_mask(frame: pd.DataFrame) -> pd.Series:
     urls = frame["poster_url"]
     return urls.isna() | urls.astype(str).str.strip().isin(["", "nan", "None"])
 
 
+#Download posters for every movie, skipping ones already in posters.csv
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -169,6 +179,7 @@ def main():
             "Run: py data_preprocessing.py --output-dir processed"
         )
 
+    #Load IMDb / TMDb ids, then attach titles for the search fallback
     movies = pd.read_csv(LINKS_PATH)
     movies = movies.dropna(subset=["movieId"]).copy()
     movies["movieId"] = movies["movieId"].astype(int)
@@ -186,9 +197,10 @@ def main():
     else:
         movies["title"] = pd.NA
 
-    # Prefer rows that at least have tmdb or imdb for primary lookup.
+    #Prefer rows that at least have tmdb or imdb for primary lookup.
     movies = movies.loc[movies["tmdbId"].notna() | movies["imdbId"].notna()].copy()
 
+    #Resume from posters.csv if a previous run already fetched some movies
     if POSTERS_PATH.exists():
         try:
             done = pd.read_csv(POSTERS_PATH)
@@ -205,6 +217,7 @@ def main():
 
     todo = movies[~movies["movieId"].isin(done_ids)]
 
+    #Re-query movies that were saved with a blank poster (failed last time)
     if args.retry_missing and not done.empty:
         blank_ids = set(done.loc[_missing_poster_mask(done), "movieId"].astype(int))
         retry = movies[movies["movieId"].isin(blank_ids)]
@@ -221,7 +234,7 @@ def main():
 
     session = requests.Session()
     rows = []
-    delay = 1.0 / REQUESTS_PER_SECOND
+    delay = 1.0 / REQUESTS_PER_SECOND #pause between API calls
 
     for i, (_, row) in enumerate(todo.iterrows(), start=1):
         poster_path = resolve_poster_path(row, session)
@@ -236,6 +249,7 @@ def main():
         )
         time.sleep(delay)
 
+        #Checkpoint every SAVE_EVERY movies (and once at the end)
         if i % SAVE_EVERY == 0 or i == len(todo):
             batch = save(done, rows)
             found = (~_missing_poster_mask(batch)).sum()

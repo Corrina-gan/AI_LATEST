@@ -86,13 +86,49 @@ TAG_STOPWORDS = frozenset(
 #Load the 4 raw MovieLens CSV files from the dataset folder
 def load_raw_data(data_dir: Path = DATA_DIR) -> dict[str, pd.DataFrame]:
     """Load raw MovieLens CSV files."""
-    return {
-        "movies": pd.read_csv(data_dir / "movies.csv"),
-        "ratings": pd.read_csv(data_dir / "ratings.csv"),
-        "tags": pd.read_csv(data_dir / "tags.csv"),
-        "links": pd.read_csv(data_dir / "links.csv"),
-    }
+    movies = pd.read_csv(data_dir / "movies.csv")
+    ratings = pd.read_csv(data_dir / "ratings.csv")
+    tags = pd.read_csv(data_dir / "tags.csv")
+    links = pd.read_csv(data_dir / "links.csv")
 
+    print("Movies shape:", movies.shape)
+    print("Movies duplicates:", movies.duplicated().sum())
+    print(movies.head())
+    movies.info()
+    print(movies.dtypes)
+    print(movies.isnull().sum())
+    print(movies.nunique())
+
+    print("Ratings shape:", ratings.shape)
+    print("Ratings duplicates:", ratings.duplicated().sum())
+    print(ratings.head())
+    ratings.info()
+    print(ratings.dtypes)
+    print(ratings.isnull().sum())
+    print(ratings.nunique())
+
+    print("Tags shape:", tags.shape)
+    print("Tags duplicates:", tags.duplicated().sum())
+    print(tags.head())
+    tags.info()
+    print(tags.dtypes)
+    print(tags.isnull().sum())
+    print(tags.nunique())
+
+    print("Links shape:", links.shape)
+    print("Links duplicates:", links.duplicated().sum())
+    print(links.head())
+    links.info()
+    print(links.dtypes)
+    print(links.isnull().sum())
+    print(links.nunique())
+
+    return {
+        "movies": movies,
+        "ratings": ratings,
+        "tags": tags,
+        "links": links,
+    }
 
 #Turn "Action|Adventure|IMAX" into a clean list of story genres
 def _normalize_genre_list(genres: object) -> list[str]:
