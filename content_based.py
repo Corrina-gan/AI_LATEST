@@ -584,7 +584,7 @@ class ContentBasedRecommender:
         )
 
     #Diversify Recommendations
-    def _mmr_diversify( #uses MMR (Maximal Marginal Relevance) = no only recommedn movie that have the highest similarity to user, recommend the movie are not too similar to each other
+    def _mmr_diversify( #uses MMR (Maximal Marginal Relevance) = no only recommend movie that have the highest similarity to user, recommend the movie are not too similar to each other
         self,
         candidate_ids: list[int],
         candidate_indices: list[int],
