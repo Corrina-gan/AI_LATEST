@@ -30,6 +30,9 @@ DEFAULT_ALPHA_GRID = [0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80] #alp
 CLASSIFICATION_THRESHOLDS = np.round(np.arange(2.5, 4.25, 0.05), 2) #try many cutoffs to find the best F1
 ITEM_SUPPORT_SHRINK = 25.0 #how fast the blend moves from content to SVD when a movie has more ratings
 MIN_CONTENT_MIX = 0.25 #content always keeps at least this share of the mix
+HYBRID_RARE_MAX = 15 #movies with this many ratings or fewer lean on content
+HYBRID_POPULAR_MIN = 120 #movies with this many ratings or more stay closer to SVD
+EXAMPLE_MIX_COUNTS = (0, 50, 120) #example rating counts shown on the weight page
 
 
 #Rating range validation
@@ -272,6 +275,112 @@ def plot_blend_weights(
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+def example_mix_at_counts(
+    alpha: float,
+    counts: tuple[int, ...] = EXAMPLE_MIX_COUNTS,
+    shrink: float = ITEM_SUPPORT_SHRINK,
+    min_mix: float = MIN_CONTENT_MIX,
+) -> list[tuple[int, float, float]]:
+    movie_ids = np.arange(len(counts))
+    item_counts = {int(index): int(count) for index, count in enumerate(counts)}
+    details = blend_hybrid_details(
+        np.full(len(counts), 4.0),
+        np.full(len(counts), 4.0),
+        movie_ids,
+        item_counts,
+        float(alpha),
+        shrink=shrink,
+        min_mix=min_mix,
+    )
+    return [
+        (int(count), float(details["content_weight"][index]), float(details["cf_weight"][index]))
+        for index, count in enumerate(counts)
+    ]
+
+
+def plot_example_mix(
+    alpha: float,
+    shrink: float = ITEM_SUPPORT_SHRINK,
+    min_mix: float = MIN_CONTENT_MIX,
+):
+    import matplotlib.pyplot as plt
+
+    mix = example_mix_at_counts(alpha, shrink=shrink, min_mix=min_mix)
+    labels = [
+        "Rare\n(0 ratings)",
+        "In between\n(50 ratings)",
+        "Popular\n(120 ratings)",
+    ]
+    content = [row[1] * 100 for row in mix]
+    collaborative = [row[2] * 100 for row in mix]
+    x = np.arange(len(labels))
+    width = 0.36
+
+    fig, ax = plt.subplots(figsize=(6.6, 3.2))
+    fig.patch.set_facecolor("#FFFFFF")
+    ax.set_facecolor("#FFFFFF")
+    ax.bar(x - width / 2, content, width, label="Content", color="#5B8FF9")
+    ax.bar(x + width / 2, collaborative, width, label="Collaborative (SVD)", color="#5AD8A6")
+    ax.set_xticks(x, labels)
+    ax.set_ylabel("Blend share (%)")
+    ax.set_ylim(0, 105)
+    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+def catalog_popularity_counts(item_counts: dict[int, int]) -> tuple[int, int, int]:
+    rare = mid = popular = 0
+    for count in item_counts.values():
+        if int(count) <= HYBRID_RARE_MAX:
+            rare += 1
+        elif int(count) >= HYBRID_POPULAR_MIN:
+            popular += 1
+        else:
+            mid += 1
+    return rare, mid, popular
+
+
+def plot_catalog_popularity(item_counts: dict[int, int]):
+    import matplotlib.pyplot as plt
+
+    rare, mid, popular = catalog_popularity_counts(item_counts)
+    labels = [
+        f"Rarely rated\n(≤{HYBRID_RARE_MAX} ratings)\nmore content",
+        f"In between\n({HYBRID_RARE_MAX + 1}–{HYBRID_POPULAR_MIN - 1})\nmixed",
+        f"Popular\n(≥{HYBRID_POPULAR_MIN} ratings)\nmore SVD",
+    ]
+    values = [rare, mid, popular]
+    colors = ["#E85D75", "#5B8FF9", "#5AD8A6"]
+
+    fig, ax = plt.subplots(figsize=(6.6, 3.4))
+    fig.patch.set_facecolor("#FFFFFF")
+    ax.set_facecolor("#FFFFFF")
+    bars = ax.bar(labels, values, color=colors, width=0.65)
+    ax.set_ylabel("Number of movies")
+    ax.set_title("How many movies fall into each blend band")
+    ax.yaxis.grid(True, color="#D0D3DA", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for bar, value in zip(bars, values, strict=True):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{value:,}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    ax.margins(y=0.14)
     fig.tight_layout()
     return fig
 
