@@ -15,6 +15,7 @@ import collaborative_filtering
 import content_based
 import data_visualization
 import hybrid
+import trained_model_store
 
 #Reloading the collaborative filtering module
 if not hasattr(collaborative_filtering, "render_controls"): #hasattr() is use to checks whether the module contains render_controls
@@ -170,7 +171,7 @@ def load_tags(data_sig: str) -> pd.DataFrame:
         tags["tagged_at"] = pd.to_datetime(tags["tagged_at"], utc=True) #Converts the tag timestamp into a proper data/ time format
     return tags
 
-#Train all these three models
+#Train all these three models (or load them from trained_model/)
 @st.cache_resource(show_spinner=False)
 def train_models(
     data_sig: str,
@@ -179,69 +180,33 @@ def train_models(
     random_state: int = 42,
 ):
     ratings, movies, movie_content, links, posters = load_dataset(data_sig) #load dataset
-    #Train/test spilt, 80/20 train test spilt
-    train_ratings, test_ratings = content_based.split_train_test(
-        ratings, test_size=test_size, random_state=random_state
-    )
-    #trian content-based
-    content_model = content_based.ContentBasedRecommender().fit(
-        train_ratings, movie_content, movies=movies
-    )
-    #train collaborative
-    collaborative_model = collaborative_filtering.CollaborativeFiltering(
-        n_factors=n_factors
-    ).fit(train_ratings, movies=movies)
-    #tune hybrid alpha, alpha = control the balance, cth: alpha = 0 mean more callaborative, alpha = 1 mean more content-based
-    best_alpha, tuning_results, hybrid_model, hybrid_metrics = hybrid.tune_alpha(
-        train_ratings,
-        test_ratings,
-        movie_content,
-        movies,
-        n_factors=n_factors,
-        relevance_threshold=4.0,
-        metric="f1_score",
-    )
-    
-    content_eval = content_model.evaluate(test_ratings, relevance_threshold=4.0) #Evaluate Content-based
-    collaborative_eval = collaborative_model.evaluate(test_ratings, relevance_threshold=4.0) #Evaluate Collaborative
-    #Hybrid Predictions
-    test_user_ids = test_ratings["userId"].astype(int).to_numpy() #get user id
-    test_movie_ids = test_ratings["movieId"].astype(int).to_numpy() #get movie id
-    hybrid_actual = test_ratings["rating"].to_numpy(dtype=float) #get actual rating
-    hybrid_predicted = hybrid.blend_hybrid_scores( #combine content-based and collaborative
-        hybrid_model.content_model.predict_many(test_user_ids, test_movie_ids),
-        hybrid_model.collaborative_model.predict_many(test_user_ids, test_movie_ids),
-        test_movie_ids,
-        hybrid_model.item_counts,
-        hybrid_model.alpha,
-        shrink=hybrid_model.item_shrink,
-        min_mix=hybrid_model.min_content_mix,
-    )
-    all_eval = { #store evaluation result
-        content_based.ALGORITHM_KEY: content_eval,
-        collaborative_filtering.ALGORITHM_KEY: collaborative_eval,
-        "hybrid": _pack_eval_arrays(hybrid_metrics["hybrid"], hybrid_actual, hybrid_predicted),
-    }
-    all_metrics = {key: _scalar_metrics(value) for key, value in all_eval.items()} #only keed the numerical metircs for model comparison
-
-    #Get all users
-    user_ids = sorted(ratings["userId"].astype(int).unique().tolist())
+    bundle = trained_model_store.load_bundle(data_sig)
+    if bundle is None:
+        bundle = trained_model_store.fit_recommenders(
+            ratings,
+            movies,
+            movie_content,
+            n_factors=n_factors,
+            test_size=test_size,
+            random_state=random_state,
+        )
+        trained_model_store.save_bundle(bundle, data_sig)
     return (
-        hybrid_model,
-        content_model,
-        collaborative_model,
-        all_metrics,
-        all_eval,
-        tuning_results,
+        bundle["hybrid_model"],
+        bundle["content_model"],
+        bundle["collaborative_model"],
+        bundle["all_metrics"],
+        bundle["all_eval"],
+        bundle["tuning_results"],
         ratings,
         movies,
         movie_content,
         links,
         posters,
-        user_ids,
-        len(train_ratings),
-        len(test_ratings),
-        best_alpha,
+        bundle["user_ids"],
+        bundle["train_size"],
+        bundle["test_size"],
+        bundle["best_alpha"],
     )
 
 #IMDb and TMDB URLs
@@ -2407,7 +2372,12 @@ def main() -> None:
     data_sig = processed_data_signature() #Get the processed data signature
 
     try: #Train or load the recommendation models
-        with st.spinner("Training models (content + collaborative + hybrid)^_^"):
+        spinner_text = (
+            "Loading trained models from trained_model..."
+            if trained_model_store.is_bundle_current(data_sig)
+            else "Training models (content + collaborative + hybrid)^_^"
+        )
+        with st.spinner(spinner_text):
             (
                 #Recommendation models
                 hybrid_model,

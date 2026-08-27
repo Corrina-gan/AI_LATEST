@@ -1,0 +1,14 @@
+Exact Instructions to Run the Program 
+
+Standard Python project
+1. Extract the submitted ZIP file.
+2. Open a terminal in the project root folder.
+3. Create and activate a virtual environment(optional).
+4. Run: pip install -r requirements.txt
+5. Confirm the dataset/model is in the stated folder.
+6. Run the streamlit
+7. For more information can get from the README.md file
+
+Streamlit
+py -m streamlit run app.py
+

@@ -1,0 +1,7 @@
+{
+  "data_sig": "ratings_clean.csv:1787572512750004300:4554516|movies_clean.csv:1787572511695240100:309179|movies_content.csv:1787572512916679700:954696",
+  "n_factors": 20,
+  "test_size": 0.2,
+  "random_state": 42,
+  "best_alpha": 0.05
+}
