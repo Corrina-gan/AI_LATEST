@@ -1,0 +1,22 @@
+Not required — do not download a model.
+
+The trained models are already in this folder. The user does not need a link, zip, or extraction step.
+
+Included files (destination = this folder, trained_model/):
+
+  content_based.joblib             3.9 MB
+    SHA256 AEB701D6FA21937CEA427A43E988DD8C0F586DBB2A738D07ABA9FB0DDFD538E3
+  collaborative_filtering.joblib  17.6 MB
+    SHA256 43517A4BDAFFDE495A9A32FBACA154F812C346103E9C47681A7249B650A3E675
+  hybrid.joblib                    4.3 MB
+    SHA256 92CE7C8E12F3A02E77ED265BB3BFF6477D535B02D5F67880017180C01EDACE33
+  evaluation.joblib                0.5 MB
+    SHA256 A5237FF90F861FFCD164DB5022256924FC0974ED90775BE560687BBCD34D316B
+
+These are joblib files (scikit-learn / NumPy), not PyTorch. There is no best_model.pt.
+
+To test the prototype, run the app from the project root. It loads these files (inference). Do not retrain.
+
+Optional rebuild only:
+  py save_trained_models.py
+  Expected time: about 4 minutes. CPU laptop. No GPU.
