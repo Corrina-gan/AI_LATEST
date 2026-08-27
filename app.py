@@ -1,7 +1,7 @@
 #Import Libraries
 from __future__ import annotations
 
-import ast #Imports Python's Abstract Syntax Tree module
+import ast #Imports Python's Abstract Syntax Tree module - safely convert a string that looks like a Python data structure into an actual Python object.
 from html import escape
 from importlib import reload
 from pathlib import Path
@@ -19,7 +19,7 @@ import trained_model_store
 
 #Reloading the collaborative filtering module
 if not hasattr(collaborative_filtering, "render_controls"): #hasattr() is use to checks whether the module contains render_controls
-    collaborative_filtering = reload(collaborative_filtering)
+    reload(collaborative_filtering)
 if not hasattr(collaborative_filtering, "DEFAULT_ITEM_METHOD"):
     collaborative_filtering.DEFAULT_ITEM_METHOD = "cosine" #if no exits, the program create cosine as default
 if not hasattr(collaborative_filtering, "DEFAULT_N_COMPONENTS"):
@@ -29,8 +29,8 @@ if not hasattr(collaborative_filtering, "ITEM_METHOD_OPTIONS"):
         "Cosine": "cosine",
         "Pearson (adjusted cosine)": "pearson",
     }
-data_visualization = reload(data_visualization)
-hybrid = reload(hybrid)
+reload(data_visualization)
+reload(hybrid)
 
 #Streamlit page configuration
 st.set_page_config(
@@ -41,7 +41,6 @@ st.set_page_config(
 )
 
 #Constants
-HybridRecommender = hybrid.HybridRecommender
 BASE_DIR = Path(__file__).resolve().parent #find directory if the current python file is located
 PROCESSED_FILES = (
     "ratings_clean.csv",
@@ -277,7 +276,7 @@ def get_recommendations(
     posters: pd.DataFrame,
     content_model: content_based.ContentBasedRecommender | None = None,
     collaborative_model: collaborative_filtering.CollaborativeFiltering | None = None,
-    hybrid_model: HybridRecommender | None = None,
+    hybrid_model: hybrid.HybridRecommender | None = None,
     rating_stats: pd.DataFrame | None = None,
     diversify: bool = False,
     diversity: float = 0.3,
