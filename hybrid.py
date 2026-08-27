@@ -937,10 +937,29 @@ class HybridRecommender:
     #Explain Why a Movie Was Recommended
     def recommendation_reasons(self, row: pd.Series, user_id: int | None = None) -> list[str]: #return a list of reason
         count = int(row.get("rating_count", 0) or 0)
-        content_weight = float(row.get("content_weight", 0.5) or 0.5)
+        raw_weight = row.get("content_weight", np.nan)
+        if raw_weight is None or (isinstance(raw_weight, float) and pd.isna(raw_weight)):
+            movie_id = row.get("movieId")
+            content_score = float(row.get("content_rating", row.get("Content score", 0.0)) or 0.0)
+            cf_score = float(row.get("cf_rating", row.get("Collaborative score", 0.0)) or 0.0)
+            if pd.notna(movie_id):
+                details = blend_hybrid_details(
+                    np.array([content_score]),
+                    np.array([cf_score]),
+                    np.array([int(movie_id)]),
+                    self.item_counts,
+                    self.alpha,
+                    shrink=self.item_shrink,
+                    min_mix=self.min_content_mix,
+                )
+                content_weight = float(details["content_weight"][0])
+            else:
+                content_weight = float(self.alpha)
+        else:
+            content_weight = float(raw_weight)
         content_score = float(row.get("content_rating", row.get("Content score", 0.0)) or 0.0)
         cf_score = float(row.get("cf_rating", row.get("Collaborative score", 0.0)) or 0.0)
-        source = str(row.get("blend_source", blend_source_label(content_weight)))
+        source = blend_source_label(content_weight)
         reasons: list[str] = []
         if user_id is not None:
             if getattr(self.content_model, "movies", None) is None:
@@ -951,10 +970,19 @@ class HybridRecommender:
                         int(user_id), int(row["movieId"])
                     )[:4]
                 )
-        reasons.append(f"{source}: {content_weight:.0%} content / {1.0 - content_weight:.0%} SVD")
-        if count <= 15:
-            reasons.append(f"Rarely rated ({count} ratings), so content has more influence")
-        elif count >= 120:
+        reasons.append(
+            f"{source}: {content_weight:.0%} content / {1.0 - content_weight:.0%} SVD"
+        )
+        if count <= HYBRID_RARE_MAX:
+            if content_weight > 0.5:
+                reasons.append(
+                    f"Rarely rated ({count} ratings), so content has more influence"
+                )
+            else:
+                reasons.append(
+                    f"Rarely rated ({count} ratings), but current alpha still keeps SVD dominant"
+                )
+        elif count >= HYBRID_POPULAR_MIN:
             reasons.append(f"Popular movie ({count} ratings), so SVD has more influence")
         else:
             reasons.append(f"{count} ratings in the training data")

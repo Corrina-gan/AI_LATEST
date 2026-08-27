@@ -418,8 +418,6 @@ def _movie_card_html(row: pd.Series, score_columns: list[str]) -> str:
         meta.append(f'<span class="star yours">★ {float(your_rating):.1f}</span>')
     elif pd.notna(avg):
         meta.append(f'<span class="star">★ {float(avg):.1f}</span>')
-    if pd.notna(avg) and pd.notna(your_rating):
-        meta.append(f'<span class="count">avg {float(avg):.1f}</span>')
     if pd.notna(count):
         n_ratings = int(count)
         label = "rating" if n_ratings == 1 else "ratings" #make the grammar correct
@@ -1025,8 +1023,8 @@ def render_hybrid_recs(
     )
     if loaded is None:
         return
-    display, score_cols = loaded #get the recommendations
-    render_recommendation_cards(display, score_cols) #Display movie cards
+    display, _score_cols = loaded #get the recommendations
+    render_recommendation_cards(display, []) #Poster grid: title, genres, avg rating only
     reasons = { #Generate recommendation reasons
         int(row["movieId"]): hybrid_model.recommendation_reasons(row, user_id=int(user_id))
         for _, row in display.iterrows()
@@ -1246,9 +1244,7 @@ def render_hybrid_search(
         )
         st.markdown(f"**Predicted rating for user {user_id}**") #Display the predicted rating
         st.caption("Content = genres/tags · SVD = people with similar ratings · Hybrid = the mix.")
-        render_recommendation_cards(
-            scored, ["Content score", "Collaborative score", "Hybrid score"]
-        )
+        render_recommendation_cards(scored, [])
         row = scored.iloc[0]
         your_rating = row.get("your_rating") #Check whether the user already rated it
         if pd.notna(your_rating):
@@ -1256,7 +1252,11 @@ def render_hybrid_search(
             st.caption(f"You already rated this movie **{shown}★**.")
         else:
             st.caption("You have not rated this movie yet.")
-        reasons = {int(row["movieId"]): hybrid_model.recommendation_reasons(row)}
+        reasons = {
+            int(row["movieId"]): hybrid_model.recommendation_reasons(
+                row, user_id=int(user_id)
+            )
+        }
         st.html(hybrid.explain_blend_table_html(scored, reasons))
 
         similar = hybrid_model.similar_to_movie( #Find similar unseen movies
@@ -1275,9 +1275,14 @@ def render_hybrid_search(
         seed_title = str(row.get("title") or "this movie")
         st.markdown(f"**Similar unseen movies · {seed_title}**")
         st.caption("Closest in genres/tags/title, then ranked by this user's hybrid score.") #Display similar movies
-        render_recommendation_cards(
-            similar, ["Content score", "Collaborative score", "Hybrid score"]
-        )
+        render_recommendation_cards(similar, [])
+        similar_reasons = {
+            int(item["movieId"]): hybrid_model.recommendation_reasons(
+                item, user_id=int(user_id)
+            )
+            for _, item in similar.iterrows()
+        }
+        st.html(hybrid.explain_blend_table_html(similar, similar_reasons))
     except ValueError as error:
         st.info(str(error))
     finally:
